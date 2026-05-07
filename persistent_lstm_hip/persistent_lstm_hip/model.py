@@ -117,6 +117,8 @@ class PersistentLSTMRegressor(nn.Module):
         with torch.no_grad():
             self.linear.weight.copy_(packed.linear_weight)
             self.linear.bias.copy_(packed.linear_bias)
+        self._specialized_cache_key: tuple[object, ...] | None = None
+        self._hip_specialized_args: tuple[torch.Tensor, ...] | None = None
 
     @property
     def backend_name(self) -> str:
@@ -146,26 +148,66 @@ class PersistentLSTMRegressor(nn.Module):
             self.linear.out_features == 24
         )
 
+    def _current_specialized_cache_key(self) -> tuple[object, ...]:
+        params = (
+            self.lstm.weight_ih_l0,
+            self.lstm.weight_hh_l0,
+            self.lstm.bias_ih_l0,
+            self.lstm.bias_hh_l0,
+            self.lstm.weight_ih_l1,
+            self.lstm.weight_hh_l1,
+            self.lstm.bias_ih_l1,
+            self.lstm.bias_hh_l1,
+            self.lstm.weight_ih_l2,
+            self.lstm.weight_hh_l2,
+            self.lstm.bias_ih_l2,
+            self.lstm.bias_hh_l2,
+            self.lstm.weight_ih_l3,
+            self.lstm.weight_hh_l3,
+            self.lstm.bias_ih_l3,
+            self.lstm.bias_hh_l3,
+            self.linear.weight,
+            self.linear.bias,
+        )
+        key_parts: list[object] = []
+        for tensor in params:
+            key_parts.extend(
+                (
+                    id(tensor),
+                    tensor.device.type,
+                    tensor.device.index,
+                    str(tensor.dtype),
+                    tensor._version,
+                )
+            )
+        return tuple(key_parts)
+
+    def _ensure_specialized_cache(self) -> tuple[torch.Tensor, ...]:
+        cache_key = self._current_specialized_cache_key()
+        if self._specialized_cache_key != cache_key or self._hip_specialized_args is None:
+            self._hip_specialized_args = (
+                self.lstm.weight_ih_l0.transpose(0, 1).contiguous(),
+                self.lstm.weight_hh_l0.transpose(0, 1).contiguous(),
+                (self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0).contiguous(),
+                self.lstm.weight_ih_l1.transpose(0, 1).contiguous(),
+                self.lstm.weight_hh_l1.transpose(0, 1).contiguous(),
+                (self.lstm.bias_ih_l1 + self.lstm.bias_hh_l1).contiguous(),
+                self.lstm.weight_ih_l2.transpose(0, 1).contiguous(),
+                self.lstm.weight_hh_l2.transpose(0, 1).contiguous(),
+                (self.lstm.bias_ih_l2 + self.lstm.bias_hh_l2).contiguous(),
+                self.lstm.weight_ih_l3.transpose(0, 1).contiguous(),
+                self.lstm.weight_hh_l3.transpose(0, 1).contiguous(),
+                (self.lstm.bias_ih_l3 + self.lstm.bias_hh_l3).contiguous(),
+                self.linear.weight.contiguous(),
+                self.linear.bias.contiguous(),
+            )
+            self._specialized_cache_key = cache_key
+        return self._hip_specialized_args
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ext = load_extension()
         if self._can_use_specialized_regressor_hip():
-            return ext.persistent_lstm4_forward_packed(
-                x,
-                self.lstm.weight_ih_l0.transpose(0, 1).contiguous(),
-                self.lstm.weight_hh_l0.transpose(0, 1).contiguous(),
-                self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0,
-                self.lstm.weight_ih_l1.transpose(0, 1).contiguous(),
-                self.lstm.weight_hh_l1.transpose(0, 1).contiguous(),
-                self.lstm.bias_ih_l1 + self.lstm.bias_hh_l1,
-                self.lstm.weight_ih_l2.transpose(0, 1).contiguous(),
-                self.lstm.weight_hh_l2.transpose(0, 1).contiguous(),
-                self.lstm.bias_ih_l2 + self.lstm.bias_hh_l2,
-                self.lstm.weight_ih_l3.transpose(0, 1).contiguous(),
-                self.lstm.weight_hh_l3.transpose(0, 1).contiguous(),
-                self.lstm.bias_ih_l3 + self.lstm.bias_hh_l3,
-                self.linear.weight,
-                self.linear.bias,
-            )
+            return ext.persistent_lstm4_forward_packed(x, *self._ensure_specialized_cache())
 
         if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):
             return ext.persistent_lstm_generic_forward(x)
