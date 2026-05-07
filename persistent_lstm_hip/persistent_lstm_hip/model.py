@@ -16,7 +16,7 @@ from .packing import (
 from .reference import reference_lstm_forward, reference_regressor_forward
 
 
-def _pack_weight_kpairs(weight: torch.Tensor) -> torch.Tensor:
+def _pack_recurrent_weight_kpairs(weight: torch.Tensor) -> torch.Tensor:
     transposed = weight.transpose(0, 1).contiguous()
     k_size, out_size = transposed.shape
     if k_size % 2 != 0:
@@ -196,17 +196,17 @@ class PersistentLSTMRegressor(nn.Module):
         cache_key = self._current_specialized_cache_key()
         if self._specialized_cache_key != cache_key or self._hip_specialized_args is None:
             self._hip_specialized_args = (
-                _pack_weight_kpairs(self.lstm.weight_ih_l0),
-                _pack_weight_kpairs(self.lstm.weight_hh_l0),
+                self.lstm.weight_ih_l0.contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l0),
                 (self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0).contiguous(),
-                _pack_weight_kpairs(self.lstm.weight_ih_l1),
-                _pack_weight_kpairs(self.lstm.weight_hh_l1),
+                self.lstm.weight_ih_l1.contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l1),
                 (self.lstm.bias_ih_l1 + self.lstm.bias_hh_l1).contiguous(),
-                _pack_weight_kpairs(self.lstm.weight_ih_l2),
-                _pack_weight_kpairs(self.lstm.weight_hh_l2),
+                self.lstm.weight_ih_l2.contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l2),
                 (self.lstm.bias_ih_l2 + self.lstm.bias_hh_l2).contiguous(),
-                _pack_weight_kpairs(self.lstm.weight_ih_l3),
-                _pack_weight_kpairs(self.lstm.weight_hh_l3),
+                self.lstm.weight_ih_l3.contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l3),
                 (self.lstm.bias_ih_l3 + self.lstm.bias_hh_l3).contiguous(),
                 self.linear.weight.contiguous(),
                 self.linear.bias.contiguous(),
@@ -217,7 +217,7 @@ class PersistentLSTMRegressor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ext = load_extension()
         if self._can_use_specialized_regressor_hip():
-            return ext.persistent_lstm4_forward_interleaved(x, *self._ensure_specialized_cache())
+            return ext.persistent_lstm4_forward_projected(x, *self._ensure_specialized_cache())
 
         if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):
             return ext.persistent_lstm_generic_forward(x)
