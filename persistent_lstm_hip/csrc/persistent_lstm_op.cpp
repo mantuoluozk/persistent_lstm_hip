@@ -246,3 +246,65 @@ torch::Tensor persistent_lstm4_forward_projected(
       linear_weight,
       linear_bias);
 }
+
+torch::Tensor persistent_lstm4_forward_monolithic(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_ih_l0_packed,
+    const torch::Tensor& weight_hh_l0_packed,
+    const torch::Tensor& bias_l0,
+    const torch::Tensor& weight_ih_l1_packed,
+    const torch::Tensor& weight_hh_l1_packed,
+    const torch::Tensor& bias_l1,
+    const torch::Tensor& weight_ih_l2_packed,
+    const torch::Tensor& weight_hh_l2_packed,
+    const torch::Tensor& bias_l2,
+    const torch::Tensor& weight_ih_l3_packed,
+    const torch::Tensor& weight_hh_l3_packed,
+    const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (x.is_cuda()) {
+    return persistent_lstm4_forward_monolithic_hip(
+        x,
+        weight_ih_l0_packed,
+        weight_hh_l0_packed,
+        bias_l0,
+        weight_ih_l1_packed,
+        weight_hh_l1_packed,
+        bias_l1,
+        weight_ih_l2_packed,
+        weight_hh_l2_packed,
+        bias_l2,
+        weight_ih_l3_packed,
+        weight_hh_l3_packed,
+        bias_l3,
+        linear_weight,
+        linear_bias);
+  }
+
+  auto unpack = [](const torch::Tensor& packed, int64_t original_k) {
+    check_shape(packed.dim() == 3, "monolithic packed weight must be rank-3");
+    auto contiguous = packed.contiguous();
+    const auto pairs = contiguous.size(0);
+    const auto out = contiguous.size(1);
+    const auto restored = contiguous.permute({0, 2, 1}).contiguous().view({pairs * 2, out});
+    return restored.narrow(0, 0, original_k).transpose(0, 1).contiguous();
+  };
+
+  return persistent_lstm4_forward_reference(
+      x,
+      unpack(weight_ih_l0_packed, 5),
+      unpack(weight_hh_l0_packed, 128),
+      bias_l0,
+      unpack(weight_ih_l1_packed, 128),
+      unpack(weight_hh_l1_packed, 128),
+      bias_l1,
+      unpack(weight_ih_l2_packed, 128),
+      unpack(weight_hh_l2_packed, 128),
+      bias_l2,
+      unpack(weight_ih_l3_packed, 128),
+      unpack(weight_hh_l3_packed, 128),
+      bias_l3,
+      linear_weight,
+      linear_bias);
+}

@@ -68,9 +68,27 @@ torch::Tensor persistent_lstm4_forward_projected(
     const torch::Tensor& linear_weight,
     const torch::Tensor& linear_bias);
 
+torch::Tensor persistent_lstm4_forward_monolithic(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_ih_l0_packed,
+    const torch::Tensor& weight_hh_l0_packed,
+    const torch::Tensor& bias_l0,
+    const torch::Tensor& weight_ih_l1_packed,
+    const torch::Tensor& weight_hh_l1_packed,
+    const torch::Tensor& bias_l1,
+    const torch::Tensor& weight_ih_l2_packed,
+    const torch::Tensor& weight_hh_l2_packed,
+    const torch::Tensor& bias_l2,
+    const torch::Tensor& weight_ih_l3_packed,
+    const torch::Tensor& weight_hh_l3_packed,
+    const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("persistent_lstm4_forward", &persistent_lstm4_forward, "Persistent LSTM 4-layer forward");
   m.def("persistent_lstm4_forward_packed", &persistent_lstm4_forward_packed, "Persistent LSTM 4-layer forward packed");
   m.def("persistent_lstm4_forward_interleaved", &persistent_lstm4_forward_interleaved, "Persistent LSTM 4-layer forward interleaved");
   m.def("persistent_lstm4_forward_projected", &persistent_lstm4_forward_projected, "Persistent LSTM 4-layer forward projected");
+  m.def("persistent_lstm4_forward_monolithic", &persistent_lstm4_forward_monolithic, "Persistent LSTM 4-layer forward monolithic");
 }

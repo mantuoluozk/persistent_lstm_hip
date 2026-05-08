@@ -196,11 +196,11 @@ class PersistentLSTMRegressor(nn.Module):
 
     def _select_specialized_backend_name(self, x: torch.Tensor | None) -> str:
         forced = os.environ.get("PERSISTENT_LSTM_HIP_BACKEND", "auto").strip().lower()
-        if forced in {"interleaved", "projected"}:
+        if forced in {"interleaved", "projected", "monolithic"}:
             return forced
         if forced not in {"", "auto"}:
             raise ValueError(
-                "PERSISTENT_LSTM_HIP_BACKEND must be one of: auto, interleaved, projected"
+                "PERSISTENT_LSTM_HIP_BACKEND must be one of: auto, interleaved, projected, monolithic"
             )
         if x is None:
             return "interleaved"
@@ -259,6 +259,8 @@ class PersistentLSTMRegressor(nn.Module):
             backend = self._select_specialized_backend_name(x)
             if backend == "projected":
                 return ext.persistent_lstm4_forward_projected(x, *projected_args)
+            if backend == "monolithic":
+                return ext.persistent_lstm4_forward_monolithic(x, *interleaved_args)
             return ext.persistent_lstm4_forward_interleaved(x, *interleaved_args)
 
         if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):

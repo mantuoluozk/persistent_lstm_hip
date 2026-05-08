@@ -555,6 +555,150 @@ __global__ void persistent_lstm_pair23_last_interleaved_kernel(
   out[b * kHiddenSize + h1] = h3_cur[h1];
 }
 
+__global__ void persistent_lstm_4layer_last_interleaved_kernel(
+    const gpu_half* __restrict__ x,
+    const gpu_half* __restrict__ weight_ih_l0_packed,
+    const gpu_half* __restrict__ weight_hh_l0_packed,
+    const gpu_half* __restrict__ bias_l0,
+    const gpu_half* __restrict__ weight_ih_l1_packed,
+    const gpu_half* __restrict__ weight_hh_l1_packed,
+    const gpu_half* __restrict__ bias_l1,
+    const gpu_half* __restrict__ weight_ih_l2_packed,
+    const gpu_half* __restrict__ weight_hh_l2_packed,
+    const gpu_half* __restrict__ bias_l2,
+    const gpu_half* __restrict__ weight_ih_l3_packed,
+    const gpu_half* __restrict__ weight_hh_l3_packed,
+    const gpu_half* __restrict__ bias_l3,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int seq_len) {
+  const int b = blockIdx.x;
+  const int lane = threadIdx.x;
+  if (b >= batch_size || lane >= kWaveThreads) {
+    return;
+  }
+  const int h0 = lane;
+  const int h1 = lane + kWaveThreads;
+
+  __shared__ gpu_half x_step[kInputSize];
+  __shared__ gpu_half h0_cur[kHiddenSize];
+  __shared__ gpu_half h1_cur[kHiddenSize];
+  __shared__ gpu_half h2_cur[kHiddenSize];
+  __shared__ gpu_half h3_cur[kHiddenSize];
+
+  float c0_reg0 = 0.0f;
+  float c0_reg1 = 0.0f;
+  float c1_reg0 = 0.0f;
+  float c1_reg1 = 0.0f;
+  float c2_reg0 = 0.0f;
+  float c2_reg1 = 0.0f;
+  float c3_reg0 = 0.0f;
+  float c3_reg1 = 0.0f;
+
+  if (lane < kInputSize) {
+    x_step[lane] = float_to_half(0.0f);
+  }
+  h0_cur[h0] = float_to_half(0.0f);
+  h0_cur[h1] = float_to_half(0.0f);
+  h1_cur[h0] = float_to_half(0.0f);
+  h1_cur[h1] = float_to_half(0.0f);
+  h2_cur[h0] = float_to_half(0.0f);
+  h2_cur[h1] = float_to_half(0.0f);
+  h3_cur[h0] = float_to_half(0.0f);
+  h3_cur[h1] = float_to_half(0.0f);
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    if (lane < kInputSize) {
+      x_step[lane] = x[(b * seq_len + t) * kInputSize + lane];
+    }
+    __syncthreads();
+
+    float i0_0 = half_to_float(bias_l0[0 * kHiddenSize + h0]);
+    float f0_0 = half_to_float(bias_l0[1 * kHiddenSize + h0]);
+    float g0_0 = half_to_float(bias_l0[2 * kHiddenSize + h0]);
+    float o0_0 = half_to_float(bias_l0[3 * kHiddenSize + h0]);
+    float i0_1 = half_to_float(bias_l0[0 * kHiddenSize + h1]);
+    float f0_1 = half_to_float(bias_l0[1 * kHiddenSize + h1]);
+    float g0_1 = half_to_float(bias_l0[2 * kHiddenSize + h1]);
+    float o0_1 = half_to_float(bias_l0[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        x_step, kInputSize, weight_ih_l0_packed, h0, h1,
+        i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_hh_l0_packed, h0, h1,
+        i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
+    c0_reg0 = sigmoidf_fast(f0_0) * c0_reg0 + sigmoidf_fast(i0_0) * tanhf(g0_0);
+    c0_reg1 = sigmoidf_fast(f0_1) * c0_reg1 + sigmoidf_fast(i0_1) * tanhf(g0_1);
+    h0_cur[h0] = float_to_half(sigmoidf_fast(o0_0) * tanhf(c0_reg0));
+    h0_cur[h1] = float_to_half(sigmoidf_fast(o0_1) * tanhf(c0_reg1));
+    __syncthreads();
+
+    float i1_0 = half_to_float(bias_l1[0 * kHiddenSize + h0]);
+    float f1_0 = half_to_float(bias_l1[1 * kHiddenSize + h0]);
+    float g1_0 = half_to_float(bias_l1[2 * kHiddenSize + h0]);
+    float o1_0 = half_to_float(bias_l1[3 * kHiddenSize + h0]);
+    float i1_1 = half_to_float(bias_l1[0 * kHiddenSize + h1]);
+    float f1_1 = half_to_float(bias_l1[1 * kHiddenSize + h1]);
+    float g1_1 = half_to_float(bias_l1[2 * kHiddenSize + h1]);
+    float o1_1 = half_to_float(bias_l1[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_ih_l1_packed, h0, h1,
+        i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
+    accumulate_packed_pairs_dual(
+        h1_cur, kHiddenSize, weight_hh_l1_packed, h0, h1,
+        i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
+    c1_reg0 = sigmoidf_fast(f1_0) * c1_reg0 + sigmoidf_fast(i1_0) * tanhf(g1_0);
+    c1_reg1 = sigmoidf_fast(f1_1) * c1_reg1 + sigmoidf_fast(i1_1) * tanhf(g1_1);
+    h1_cur[h0] = float_to_half(sigmoidf_fast(o1_0) * tanhf(c1_reg0));
+    h1_cur[h1] = float_to_half(sigmoidf_fast(o1_1) * tanhf(c1_reg1));
+    __syncthreads();
+
+    float i2_0 = half_to_float(bias_l2[0 * kHiddenSize + h0]);
+    float f2_0 = half_to_float(bias_l2[1 * kHiddenSize + h0]);
+    float g2_0 = half_to_float(bias_l2[2 * kHiddenSize + h0]);
+    float o2_0 = half_to_float(bias_l2[3 * kHiddenSize + h0]);
+    float i2_1 = half_to_float(bias_l2[0 * kHiddenSize + h1]);
+    float f2_1 = half_to_float(bias_l2[1 * kHiddenSize + h1]);
+    float g2_1 = half_to_float(bias_l2[2 * kHiddenSize + h1]);
+    float o2_1 = half_to_float(bias_l2[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        h1_cur, kHiddenSize, weight_ih_l2_packed, h0, h1,
+        i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_hh_l2_packed, h0, h1,
+        i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
+    c2_reg0 = sigmoidf_fast(f2_0) * c2_reg0 + sigmoidf_fast(i2_0) * tanhf(g2_0);
+    c2_reg1 = sigmoidf_fast(f2_1) * c2_reg1 + sigmoidf_fast(i2_1) * tanhf(g2_1);
+    h2_cur[h0] = float_to_half(sigmoidf_fast(o2_0) * tanhf(c2_reg0));
+    h2_cur[h1] = float_to_half(sigmoidf_fast(o2_1) * tanhf(c2_reg1));
+    __syncthreads();
+
+    float i3_0 = half_to_float(bias_l3[0 * kHiddenSize + h0]);
+    float f3_0 = half_to_float(bias_l3[1 * kHiddenSize + h0]);
+    float g3_0 = half_to_float(bias_l3[2 * kHiddenSize + h0]);
+    float o3_0 = half_to_float(bias_l3[3 * kHiddenSize + h0]);
+    float i3_1 = half_to_float(bias_l3[0 * kHiddenSize + h1]);
+    float f3_1 = half_to_float(bias_l3[1 * kHiddenSize + h1]);
+    float g3_1 = half_to_float(bias_l3[2 * kHiddenSize + h1]);
+    float o3_1 = half_to_float(bias_l3[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_ih_l3_packed, h0, h1,
+        i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
+    accumulate_packed_pairs_dual(
+        h3_cur, kHiddenSize, weight_hh_l3_packed, h0, h1,
+        i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
+    c3_reg0 = sigmoidf_fast(f3_0) * c3_reg0 + sigmoidf_fast(i3_0) * tanhf(g3_0);
+    c3_reg1 = sigmoidf_fast(f3_1) * c3_reg1 + sigmoidf_fast(i3_1) * tanhf(g3_1);
+    h3_cur[h0] = float_to_half(sigmoidf_fast(o3_0) * tanhf(c3_reg0));
+    h3_cur[h1] = float_to_half(sigmoidf_fast(o3_1) * tanhf(c3_reg1));
+    __syncthreads();
+  }
+
+  out[b * kHiddenSize + h0] = h3_cur[h0];
+  out[b * kHiddenSize + h1] = h3_cur[h1];
+}
+
 __global__ void persistent_lstm_projected_full_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh_packed,
@@ -1253,6 +1397,106 @@ torch::Tensor persistent_lstm4_forward_projected_hip(
       reinterpret_cast<gpu_half*>(last.data_ptr<at::Half>()),
       static_cast<int>(batch_size),
       static_cast<int>(seq_len));
+  check_last_error();
+
+  return torch::matmul(last, linear_weight.transpose(0, 1)) + linear_bias;
+}
+
+torch::Tensor persistent_lstm4_forward_monolithic_hip(
+    const torch::Tensor& x,
+    const torch::Tensor& weight_ih_l0_packed,
+    const torch::Tensor& weight_hh_l0_packed,
+    const torch::Tensor& bias_l0,
+    const torch::Tensor& weight_ih_l1_packed,
+    const torch::Tensor& weight_hh_l1_packed,
+    const torch::Tensor& bias_l1,
+    const torch::Tensor& weight_ih_l2_packed,
+    const torch::Tensor& weight_hh_l2_packed,
+    const torch::Tensor& bias_l2,
+    const torch::Tensor& weight_ih_l3_packed,
+    const torch::Tensor& weight_hh_l3_packed,
+    const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (!can_use_interleaved_kernel(
+          x,
+          weight_ih_l0_packed,
+          weight_hh_l0_packed,
+          bias_l0,
+          weight_ih_l1_packed,
+          weight_hh_l1_packed,
+          bias_l1,
+          weight_ih_l2_packed,
+          weight_hh_l2_packed,
+          bias_l2,
+          weight_ih_l3_packed,
+          weight_hh_l3_packed,
+          bias_l3)) {
+    auto unpack = [](const torch::Tensor& packed, int64_t original_k) {
+      auto contiguous = packed.contiguous();
+      const auto pairs = contiguous.size(0);
+      const auto out = contiguous.size(1);
+      const auto restored = contiguous.permute({0, 2, 1}).contiguous().view({pairs * 2, out});
+      return restored.narrow(0, 0, original_k).transpose(0, 1).contiguous();
+    };
+    return persistent_lstm4_forward_reference(
+        x,
+        unpack(weight_ih_l0_packed, kInputSize),
+        unpack(weight_hh_l0_packed, kHiddenSize),
+        bias_l0,
+        unpack(weight_ih_l1_packed, kHiddenSize),
+        unpack(weight_hh_l1_packed, kHiddenSize),
+        bias_l1,
+        unpack(weight_ih_l2_packed, kHiddenSize),
+        unpack(weight_hh_l2_packed, kHiddenSize),
+        bias_l2,
+        unpack(weight_ih_l3_packed, kHiddenSize),
+        unpack(weight_hh_l3_packed, kHiddenSize),
+        bias_l3,
+        linear_weight,
+        linear_bias);
+  }
+
+  auto x_c = x.contiguous();
+  auto wih0 = weight_ih_l0_packed.contiguous();
+  auto whh0 = weight_hh_l0_packed.contiguous();
+  auto b0 = bias_l0.contiguous();
+  auto wih1 = weight_ih_l1_packed.contiguous();
+  auto whh1 = weight_hh_l1_packed.contiguous();
+  auto b1 = bias_l1.contiguous();
+  auto wih2 = weight_ih_l2_packed.contiguous();
+  auto whh2 = weight_hh_l2_packed.contiguous();
+  auto b2 = bias_l2.contiguous();
+  auto wih3 = weight_ih_l3_packed.contiguous();
+  auto whh3 = weight_hh_l3_packed.contiguous();
+  auto b3 = bias_l3.contiguous();
+
+  const int batch_size = static_cast<int>(x_c.size(0));
+  const int seq_len = static_cast<int>(x_c.size(1));
+  auto last = torch::empty({batch_size, kHiddenSize}, x_c.options());
+
+  GPU_LAUNCH_KERNEL(
+      persistent_lstm_4layer_last_interleaved_kernel,
+      batch_size,
+      kWaveThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(x_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih1.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh1.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b1.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih2.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh2.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b2.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b3.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(last.data_ptr<at::Half>()),
+      batch_size,
+      seq_len);
   check_last_error();
 
   return torch::matmul(last, linear_weight.transpose(0, 1)) + linear_bias;
