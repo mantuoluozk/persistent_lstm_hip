@@ -946,6 +946,87 @@ __global__ void persistent_lstm_generic_projected_layer_p4_kernel(
   }
 }
 
+__global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int seq_len,
+    bool write_sequence) {
+  constexpr int kH = 64;
+  constexpr int kPartitions = 4;
+  constexpr int kPerPartition = kH / kPartitions;
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int h = tid / kPartitions;
+  const int partition = tid & (kPartitions - 1);
+  __shared__ gpu_half h_cur[kH];
+
+  gpu_half i_w[kPerPartition];
+  gpu_half f_w[kPerPartition];
+  gpu_half g_w[kPerPartition];
+  gpu_half o_w[kPerPartition];
+
+  #pragma unroll
+  for (int idx = 0; idx < kPerPartition; ++idx) {
+    const int k = partition + idx * kPartitions;
+    i_w[idx] = weight_hh[(0 * kH + h) * kH + k];
+    f_w[idx] = weight_hh[(1 * kH + h) * kH + k];
+    g_w[idx] = weight_hh[(2 * kH + h) * kH + k];
+    o_w[idx] = weight_hh[(3 * kH + h) * kH + k];
+  }
+
+  float c_reg = 0.0f;
+  if (partition == 0) {
+    h_cur[h] = float_to_half(0.0f);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    float i_recur = 0.0f;
+    float f_recur = 0.0f;
+    float g_recur = 0.0f;
+    float o_recur = 0.0f;
+
+    #pragma unroll
+    for (int idx = 0; idx < kPerPartition; ++idx) {
+      const int k = partition + idx * kPartitions;
+      const float hv = half_to_float(h_cur[k]);
+      i_recur += hv * half_to_float(i_w[idx]);
+      f_recur += hv * half_to_float(f_w[idx]);
+      g_recur += hv * half_to_float(g_w[idx]);
+      o_recur += hv * half_to_float(o_w[idx]);
+    }
+
+    i_recur = reduce_partition_sum<kPartitions>(i_recur);
+    f_recur = reduce_partition_sum<kPartitions>(f_recur);
+    g_recur = reduce_partition_sum<kPartitions>(g_recur);
+    o_recur = reduce_partition_sum<kPartitions>(o_recur);
+
+    if (partition == 0) {
+      const int gate_base = (b * seq_len + t) * (4 * kH);
+      const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) + i_recur;
+      const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) + f_recur;
+      const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) + g_recur;
+      const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) + o_recur;
+      const float i_gate = sigmoidf_fast(i_acc);
+      const float f_gate = sigmoidf_fast(f_acc);
+      const float g_gate = tanhf(g_acc);
+      const float o_gate = sigmoidf_fast(o_acc);
+      c_reg = f_gate * c_reg + i_gate * g_gate;
+      h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+      if (write_sequence) {
+        out[(b * seq_len + t) * kH + h] = h_cur[h];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!write_sequence && partition == 0) {
+    out[b * kH + h] = h_cur[h];
+  }
+}
+
 __global__ void persistent_lstm_projected_uniform_full_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh_packed,
@@ -2630,16 +2711,30 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
     auto layer_out = is_last
         ? torch::empty({batch_size, hidden_size}, x.options())
         : torch::empty({batch_size, seq_len, hidden_size}, x.options());
+    const bool use_h64 = hidden_size == 64;
     const bool use_p4 = hidden_size <= 256;
     int threads = 1;
-    const int64_t logical_threads = use_p4 ? hidden_size * 4 : hidden_size;
+    const int64_t logical_threads = (use_h64 || use_p4) ? hidden_size * 4 : hidden_size;
     while (threads < logical_threads) {
       threads <<= 1;
     }
     threads = std::min(threads, 1024);
     const int shared_bytes = static_cast<int>(hidden_size * sizeof(gpu_half));
 
-    if (use_p4) {
+    if (use_h64) {
+      GPU_LAUNCH_KERNEL(
+          persistent_lstm_h64_projected_layer_p4_kernel,
+          static_cast<int>(batch_size),
+          256,
+          0,
+          0,
+          reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+          static_cast<int>(batch_size),
+          static_cast<int>(seq_len),
+          !is_last);
+    } else if (use_p4) {
       GPU_LAUNCH_KERNEL(
           persistent_lstm_generic_projected_layer_p4_kernel,
           static_cast<int>(batch_size),

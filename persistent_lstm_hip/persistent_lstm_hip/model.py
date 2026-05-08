@@ -222,6 +222,7 @@ class NativeModuleFallback(nn.Module):
                         f"input_size={int(args[0].size(2))}, "
                         f"hidden_size={int(self.module.lstm.hidden_size)}, "
                         f"num_layers={int(self.module.lstm.num_layers)}, "
+                        f"hidden_bucket={'h64' if int(self.module.lstm.hidden_size) == 64 else 'generic'}, "
                         f"generic_projected_p4={int(self.module.lstm.hidden_size) <= 256}, "
                         "uniform_batch_fast_path=False"
                     )
