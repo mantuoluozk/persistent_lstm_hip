@@ -30,7 +30,6 @@ constexpr int kThreads = 128;
 constexpr int kWaveThreads = 64;
 constexpr int kGateCols = 4 * kHiddenSize;
 constexpr int kHiddenPairs = kHiddenSize / 2;
-constexpr int kInputPairs = (kInputSize + 1) / 2;
 
 __device__ inline float sigmoidf_fast(float x) {
   return 1.0f / (1.0f + expf(-x));
@@ -94,88 +93,6 @@ __device__ inline void accumulate_packed_pairs_dual(
     const int k1 = k0 + 1;
     const float v0 = k0 < value_count ? half_to_float(values[k0]) : 0.0f;
     const float v1 = k1 < value_count ? half_to_float(values[k1]) : 0.0f;
-    const int pair_base = pair_idx * (kGateCols * 2);
-    i0_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 1]);
-    f0_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 1]);
-    g0_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 1]);
-    o0_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 1]);
-    i1_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 1]);
-    f1_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 1]);
-    g1_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 1]);
-    o1_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 1]);
-  }
-}
-
-__device__ inline void accumulate_input5_packed_pairs_dual(
-    const gpu_half* __restrict__ values,
-    const gpu_half* __restrict__ weights_packed,
-    int out_idx0,
-    int out_idx1,
-    float& i0_acc,
-    float& f0_acc,
-    float& g0_acc,
-    float& o0_acc,
-    float& i1_acc,
-    float& f1_acc,
-    float& g1_acc,
-    float& o1_acc) {
-  const int col_base0 = out_idx0 * 2;
-  const int col_base1 = out_idx1 * 2;
-#pragma unroll
-  for (int pair_idx = 0; pair_idx < kInputPairs; ++pair_idx) {
-    const int k0 = pair_idx * 2;
-    const int k1 = k0 + 1;
-    const float v0 = k0 < kInputSize ? half_to_float(values[k0]) : 0.0f;
-    const float v1 = k1 < kInputSize ? half_to_float(values[k1]) : 0.0f;
-    const int pair_base = pair_idx * (kGateCols * 2);
-    i0_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 1]);
-    f0_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 1]);
-    g0_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 1]);
-    o0_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 1]);
-    i1_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 1]);
-    f1_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 1]);
-    g1_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 1]);
-    o1_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 0]) +
-              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 1]);
-  }
-}
-
-__device__ inline void accumulate_hidden128_packed_pairs_dual(
-    const gpu_half* __restrict__ values,
-    const gpu_half* __restrict__ weights_packed,
-    int out_idx0,
-    int out_idx1,
-    float& i0_acc,
-    float& f0_acc,
-    float& g0_acc,
-    float& o0_acc,
-    float& i1_acc,
-    float& f1_acc,
-    float& g1_acc,
-    float& o1_acc) {
-  const int col_base0 = out_idx0 * 2;
-  const int col_base1 = out_idx1 * 2;
-#pragma unroll 8
-  for (int pair_idx = 0; pair_idx < kHiddenPairs; ++pair_idx) {
-    const int k0 = pair_idx * 2;
-    const int k1 = k0 + 1;
-    const float v0 = half_to_float(values[k0]);
-    const float v1 = half_to_float(values[k1]);
     const int pair_base = pair_idx * (kGateCols * 2);
     i0_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 0]) +
               v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 1]);
@@ -481,11 +398,11 @@ __global__ void persistent_lstm_pair01_interleaved_kernel(
     float f0_1 = half_to_float(bias_l0[1 * kHiddenSize + h1]);
     float g0_1 = half_to_float(bias_l0[2 * kHiddenSize + h1]);
     float o0_1 = half_to_float(bias_l0[3 * kHiddenSize + h1]);
-    accumulate_input5_packed_pairs_dual(
-        x_step, weight_ih_l0_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        x_step, kInputSize, weight_ih_l0_packed, h0, h1,
         i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
-    accumulate_hidden128_packed_pairs_dual(
-        h0_cur, weight_hh_l0_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_hh_l0_packed, h0, h1,
         i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
 
     const float i0_gate0 = sigmoidf_fast(i0_0);
@@ -510,11 +427,11 @@ __global__ void persistent_lstm_pair01_interleaved_kernel(
     float f1_1 = half_to_float(bias_l1[1 * kHiddenSize + h1]);
     float g1_1 = half_to_float(bias_l1[2 * kHiddenSize + h1]);
     float o1_1 = half_to_float(bias_l1[3 * kHiddenSize + h1]);
-    accumulate_hidden128_packed_pairs_dual(
-        h0_cur, weight_ih_l1_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_ih_l1_packed, h0, h1,
         i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
-    accumulate_hidden128_packed_pairs_dual(
-        h1_cur, weight_hh_l1_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h1_cur, kHiddenSize, weight_hh_l1_packed, h0, h1,
         i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
 
     const float i1_gate0 = sigmoidf_fast(i1_0);
@@ -583,11 +500,11 @@ __global__ void persistent_lstm_pair23_last_interleaved_kernel(
     float f2_1 = half_to_float(bias_l2[1 * kHiddenSize + h1]);
     float g2_1 = half_to_float(bias_l2[2 * kHiddenSize + h1]);
     float o2_1 = half_to_float(bias_l2[3 * kHiddenSize + h1]);
-    accumulate_hidden128_packed_pairs_dual(
-        x_step, weight_ih_l2_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        x_step, kHiddenSize, weight_ih_l2_packed, h0, h1,
         i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
-    accumulate_hidden128_packed_pairs_dual(
-        h2_cur, weight_hh_l2_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_hh_l2_packed, h0, h1,
         i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
 
     const float i2_gate0 = sigmoidf_fast(i2_0);
@@ -612,11 +529,11 @@ __global__ void persistent_lstm_pair23_last_interleaved_kernel(
     float f3_1 = half_to_float(bias_l3[1 * kHiddenSize + h1]);
     float g3_1 = half_to_float(bias_l3[2 * kHiddenSize + h1]);
     float o3_1 = half_to_float(bias_l3[3 * kHiddenSize + h1]);
-    accumulate_hidden128_packed_pairs_dual(
-        h2_cur, weight_ih_l3_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_ih_l3_packed, h0, h1,
         i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
-    accumulate_hidden128_packed_pairs_dual(
-        h3_cur, weight_hh_l3_packed, h0, h1,
+    accumulate_packed_pairs_dual(
+        h3_cur, kHiddenSize, weight_hh_l3_packed, h0, h1,
         i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
 
     const float i3_gate0 = sigmoidf_fast(i3_0);
