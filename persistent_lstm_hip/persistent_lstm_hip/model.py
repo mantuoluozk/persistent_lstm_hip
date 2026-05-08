@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import torch
@@ -128,12 +129,13 @@ class PersistentLSTMRegressor(nn.Module):
             self.linear.weight.copy_(packed.linear_weight)
             self.linear.bias.copy_(packed.linear_bias)
         self._specialized_cache_key: tuple[object, ...] | None = None
-        self._hip_specialized_args: tuple[torch.Tensor, ...] | None = None
+        self._hip_projected_args: tuple[torch.Tensor, ...] | None = None
+        self._hip_interleaved_args: tuple[torch.Tensor, ...] | None = None
 
     @property
     def backend_name(self) -> str:
         if self._can_use_specialized_regressor_hip():
-            return "hip_specialized_4layer_regressor"
+            return f"hip_specialized_4layer_regressor[{self._select_specialized_backend_name(None)}]"
         return "python_reference_generic"
 
     @classmethod
@@ -192,10 +194,30 @@ class PersistentLSTMRegressor(nn.Module):
             )
         return tuple(key_parts)
 
-    def _ensure_specialized_cache(self) -> tuple[torch.Tensor, ...]:
+    def _select_specialized_backend_name(self, x: torch.Tensor | None) -> str:
+        forced = os.environ.get("PERSISTENT_LSTM_HIP_BACKEND", "auto").strip().lower()
+        if forced in {"interleaved", "projected"}:
+            return forced
+        if forced not in {"", "auto"}:
+            raise ValueError(
+                "PERSISTENT_LSTM_HIP_BACKEND must be one of: auto, interleaved, projected"
+            )
+        if x is None:
+            return "interleaved"
+        batch_size = int(x.size(0))
+        seq_len = int(x.size(1))
+        if batch_size <= 64 and seq_len >= 256:
+            return "projected"
+        return "interleaved"
+
+    def _ensure_specialized_cache(self) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         cache_key = self._current_specialized_cache_key()
-        if self._specialized_cache_key != cache_key or self._hip_specialized_args is None:
-            self._hip_specialized_args = (
+        if (
+            self._specialized_cache_key != cache_key or
+            self._hip_projected_args is None or
+            self._hip_interleaved_args is None
+        ):
+            self._hip_projected_args = (
                 self.lstm.weight_ih_l0.contiguous(),
                 _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l0),
                 (self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0).contiguous(),
@@ -211,13 +233,33 @@ class PersistentLSTMRegressor(nn.Module):
                 self.linear.weight.contiguous(),
                 self.linear.bias.contiguous(),
             )
+            self._hip_interleaved_args = (
+                _pack_recurrent_weight_kpairs(self.lstm.weight_ih_l0),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l0),
+                (self.lstm.bias_ih_l0 + self.lstm.bias_hh_l0).contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_ih_l1),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l1),
+                (self.lstm.bias_ih_l1 + self.lstm.bias_hh_l1).contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_ih_l2),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l2),
+                (self.lstm.bias_ih_l2 + self.lstm.bias_hh_l2).contiguous(),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_ih_l3),
+                _pack_recurrent_weight_kpairs(self.lstm.weight_hh_l3),
+                (self.lstm.bias_ih_l3 + self.lstm.bias_hh_l3).contiguous(),
+                self.linear.weight.contiguous(),
+                self.linear.bias.contiguous(),
+            )
             self._specialized_cache_key = cache_key
-        return self._hip_specialized_args
+        return self._hip_projected_args, self._hip_interleaved_args
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ext = load_extension()
         if self._can_use_specialized_regressor_hip():
-            return ext.persistent_lstm4_forward_projected(x, *self._ensure_specialized_cache())
+            projected_args, interleaved_args = self._ensure_specialized_cache()
+            backend = self._select_specialized_backend_name(x)
+            if backend == "projected":
+                return ext.persistent_lstm4_forward_projected(x, *projected_args)
+            return ext.persistent_lstm4_forward_interleaved(x, *interleaved_args)
 
         if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):
             return ext.persistent_lstm_generic_forward(x)
