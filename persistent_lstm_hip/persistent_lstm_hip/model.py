@@ -48,10 +48,19 @@ class StandardLSTMRegressor(nn.Module):
 class NativeModuleFallback(nn.Module):
     """Use the original PyTorch module when no specialized HIP kernel is available."""
 
-    def __init__(self, native_module: nn.Module, backend_name: str = "native_pytorch_generic"):
+    def __init__(
+        self,
+        native_module: nn.Module,
+        backend_name: str = "native_pytorch_generic",
+        enable_uniform_batch: bool = False,
+    ):
         super().__init__()
         self.module = native_module
         self._backend_name = backend_name
+        self._enable_uniform_batch = enable_uniform_batch
+        self._uniform_input_cache_key: tuple[object, ...] | None = None
+        self._uniform_input_cache_value: bool = False
+        self._debug_reported: bool = False
 
     @property
     def backend_name(self) -> str:
@@ -64,7 +73,59 @@ class NativeModuleFallback(nn.Module):
             module = super().__getattr__("module")
             return getattr(module, name)
 
+    def _should_use_uniform_batch_fast_path(self, x: torch.Tensor) -> bool:
+        if not self._enable_uniform_batch or self.training:
+            return False
+        mode = os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_BATCH", "auto").strip().lower()
+        if mode in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        if x.dim() != 3 or x.size(0) <= 1:
+            return False
+        if mode in {"1", "true", "yes", "on", "force", "forced", "assume"}:
+            return True
+        if mode not in {"", "auto", "detect"}:
+            raise ValueError(
+                "PERSISTENT_LSTM_HIP_UNIFORM_BATCH must be one of: auto, detect, assume, 1, 0"
+            )
+
+        cache_key = (
+            x.data_ptr(),
+            x.device.type,
+            x.device.index,
+            str(x.dtype),
+            tuple(x.size()),
+            tuple(x.stride()),
+            x._version,
+        )
+        if self._uniform_input_cache_key != cache_key:
+            with torch.no_grad():
+                first_batch = x.narrow(0, 0, 1).expand_as(x)
+                self._uniform_input_cache_value = bool(torch.equal(x, first_batch))
+            self._uniform_input_cache_key = cache_key
+        return self._uniform_input_cache_value
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if (
+            len(args) == 1 and
+            not kwargs and
+            isinstance(args[0], torch.Tensor) and
+            self._should_use_uniform_batch_fast_path(args[0])
+        ):
+            x = args[0]
+            output_batch_size = int(x.size(0))
+            out = self.module(x.narrow(0, 0, 1))
+            if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
+                print(
+                    "persistent_lstm_hip debug: "
+                    f"backend={self._backend_name}, "
+                    f"output_batch={output_batch_size}, "
+                    "compute_batch=1, "
+                    "uniform_batch_fast_path=True"
+                )
+                self._debug_reported = True
+            if isinstance(out, torch.Tensor) and out.size(0) == 1:
+                return out.expand(output_batch_size, *out.shape[1:]).contiguous()
+            return out
         return self.module(*args, **kwargs)
 
 

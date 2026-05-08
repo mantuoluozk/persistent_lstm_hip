@@ -22,7 +22,11 @@ def convert_regressor_module(model: nn.Module) -> nn.Module:
         return NativeModuleFallback(copy.deepcopy(model), "native_pytorch_unsupported_lstm")
     if converted._can_use_specialized_regressor_hip():
         return converted
-    return NativeModuleFallback(copy.deepcopy(model), "native_pytorch_generic_lstm")
+    return NativeModuleFallback(
+        copy.deepcopy(model),
+        "native_pytorch_generic_lstm",
+        enable_uniform_batch=True,
+    )
 
 
 def replace_lstm_inplace(model: nn.Module) -> nn.Module:
