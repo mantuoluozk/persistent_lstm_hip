@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,29 @@ class StandardLSTMRegressor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
         return self.linear(self.dropout(out[:, -1, :]))
+
+
+class NativeModuleFallback(nn.Module):
+    """Use the original PyTorch module when no specialized HIP kernel is available."""
+
+    def __init__(self, native_module: nn.Module, backend_name: str = "native_pytorch_generic"):
+        super().__init__()
+        self.module = native_module
+        self._backend_name = backend_name
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            module = super().__getattr__("module")
+            return getattr(module, name)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.module(*args, **kwargs)
 
 
 class PersistentLSTM(nn.Module):
@@ -379,9 +402,6 @@ class PersistentLSTMRegressor(nn.Module):
                     return ext.repeat_first_row(out, output_batch_size)
                 return out.narrow(0, 0, 1).expand(output_batch_size, -1).contiguous()
             return out
-
-        if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):
-            return ext.persistent_lstm_generic_forward(x)
 
         return reference_regressor_forward(x, self._packed())
 
