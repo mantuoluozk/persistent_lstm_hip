@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #ifdef __HIP_PLATFORM_AMD__
 #include <hip/hip_fp16.h>
@@ -826,6 +827,58 @@ __global__ void persistent_lstm_projected_last_kernel(
   }
 
   out[b * kHiddenSize + h] = h_cur[h];
+}
+
+__global__ void persistent_lstm_generic_projected_layer_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int seq_len,
+    int hidden_size,
+    bool write_sequence) {
+  const int b = blockIdx.x;
+  const int h = threadIdx.x;
+  extern __shared__ gpu_half h_cur[];
+  float c_reg = 0.0f;
+
+  if (h < hidden_size) {
+    h_cur[h] = float_to_half(0.0f);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    if (h < hidden_size) {
+      const int gate_base = (b * seq_len + t) * (4 * hidden_size);
+      float i_acc = half_to_float(gate_proj[gate_base + 0 * hidden_size + h]);
+      float f_acc = half_to_float(gate_proj[gate_base + 1 * hidden_size + h]);
+      float g_acc = half_to_float(gate_proj[gate_base + 2 * hidden_size + h]);
+      float o_acc = half_to_float(gate_proj[gate_base + 3 * hidden_size + h]);
+
+      for (int k = 0; k < hidden_size; ++k) {
+        const float hv = half_to_float(h_cur[k]);
+        i_acc += hv * half_to_float(weight_hh[(0 * hidden_size + h) * hidden_size + k]);
+        f_acc += hv * half_to_float(weight_hh[(1 * hidden_size + h) * hidden_size + k]);
+        g_acc += hv * half_to_float(weight_hh[(2 * hidden_size + h) * hidden_size + k]);
+        o_acc += hv * half_to_float(weight_hh[(3 * hidden_size + h) * hidden_size + k]);
+      }
+
+      const float i_gate = sigmoidf_fast(i_acc);
+      const float f_gate = sigmoidf_fast(f_acc);
+      const float g_gate = tanhf(g_acc);
+      const float o_gate = sigmoidf_fast(o_acc);
+      c_reg = f_gate * c_reg + i_gate * g_gate;
+      h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+      if (write_sequence) {
+        out[(b * seq_len + t) * hidden_size + h] = h_cur[h];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!write_sequence && h < hidden_size) {
+    out[b * hidden_size + h] = h_cur[h];
+  }
 }
 
 __global__ void persistent_lstm_projected_uniform_full_kernel(
@@ -2452,4 +2505,95 @@ torch::Tensor persistent_lstm4_forward_monolithic_hip(
   check_last_error();
 
   return linear_head_hip(last, linear_weight, linear_bias);
+}
+
+torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
+    const torch::Tensor& x,
+    const std::vector<torch::Tensor>& weight_ih,
+    const std::vector<torch::Tensor>& weight_hh,
+    const std::vector<torch::Tensor>& bias,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (!(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.dim() == 3)) {
+    throw std::invalid_argument("generic projected LSTM expects FP16 CUDA x with shape [B, T, I]");
+  }
+  const int64_t num_layers = static_cast<int64_t>(weight_ih.size());
+  if (num_layers <= 0 || weight_hh.size() != weight_ih.size() || bias.size() != weight_ih.size()) {
+    throw std::invalid_argument("generic projected LSTM weights must have matching non-empty layer lists");
+  }
+
+  auto layer_input = x.contiguous();
+  const int64_t batch_size = layer_input.size(0);
+  const int64_t seq_len = layer_input.size(1);
+  int64_t input_size = layer_input.size(2);
+  int64_t hidden_size = -1;
+
+  for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+    auto wih = weight_ih[layer_idx].contiguous();
+    auto whh = weight_hh[layer_idx].contiguous();
+    auto b = bias[layer_idx].contiguous();
+    if (!(wih.is_cuda() && whh.is_cuda() && b.is_cuda() &&
+          wih.scalar_type() == torch::kFloat16 &&
+          whh.scalar_type() == torch::kFloat16 &&
+          b.scalar_type() == torch::kFloat16 &&
+          wih.dim() == 2 && whh.dim() == 2 && b.dim() == 1 &&
+          wih.size(1) == input_size &&
+          whh.size(0) == wih.size(0) &&
+          wih.size(0) % 4 == 0 &&
+          b.size(0) == wih.size(0))) {
+      throw std::invalid_argument("generic projected LSTM received incompatible layer weights");
+    }
+
+    const int64_t layer_hidden_size = wih.size(0) / 4;
+    if (!(whh.size(0) == 4 * layer_hidden_size && whh.size(1) == layer_hidden_size)) {
+      throw std::invalid_argument("generic projected LSTM recurrent weight must be [4H, H]");
+    }
+    if (hidden_size < 0) {
+      hidden_size = layer_hidden_size;
+      if (hidden_size <= 0 || hidden_size > 1024) {
+        throw std::invalid_argument("generic projected LSTM currently supports 1 <= hidden_size <= 1024");
+      }
+    } else if (layer_hidden_size != hidden_size) {
+      throw std::invalid_argument("generic projected LSTM currently requires the same hidden_size for every layer");
+    }
+
+    auto input_2d = layer_input.view({batch_size * seq_len, input_size});
+    auto gate = (torch::matmul(input_2d, wih.transpose(0, 1)) + b)
+                    .view({batch_size, seq_len, 4 * hidden_size})
+                    .contiguous();
+    const bool is_last = layer_idx == num_layers - 1;
+    auto layer_out = is_last
+        ? torch::empty({batch_size, hidden_size}, x.options())
+        : torch::empty({batch_size, seq_len, hidden_size}, x.options());
+    int threads = 1;
+    while (threads < hidden_size) {
+      threads <<= 1;
+    }
+    threads = std::min(threads, 1024);
+    const int shared_bytes = static_cast<int>(hidden_size * sizeof(gpu_half));
+
+    GPU_LAUNCH_KERNEL(
+        persistent_lstm_generic_projected_layer_kernel,
+        static_cast<int>(batch_size),
+        threads,
+        shared_bytes,
+        0,
+        reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+        reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+        reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+        static_cast<int>(batch_size),
+        static_cast<int>(seq_len),
+        static_cast<int>(hidden_size),
+        !is_last);
+    check_last_error();
+
+    if (!is_last) {
+      layer_input = layer_out;
+      input_size = hidden_size;
+    } else {
+      return torch::matmul(layer_out, linear_weight.contiguous().transpose(0, 1)) + linear_bias.contiguous();
+    }
+  }
+
+  throw std::runtime_error("generic projected LSTM reached an unexpected empty output path");
 }

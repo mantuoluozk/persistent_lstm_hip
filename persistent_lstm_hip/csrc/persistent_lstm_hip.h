@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <vector>
 
 torch::Tensor persistent_lstm4_forward_hip(
     const torch::Tensor& x,
@@ -101,5 +102,13 @@ torch::Tensor persistent_lstm4_forward_reference(
     const torch::Tensor& weight_ih_l3,
     const torch::Tensor& weight_hh_l3,
     const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias);
+
+torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
+    const torch::Tensor& x,
+    const std::vector<torch::Tensor>& weight_ih,
+    const std::vector<torch::Tensor>& weight_hh,
+    const std::vector<torch::Tensor>& bias,
     const torch::Tensor& linear_weight,
     const torch::Tensor& linear_bias);

@@ -60,10 +60,20 @@ class NativeModuleFallback(nn.Module):
         self._enable_uniform_batch = enable_uniform_batch
         self._uniform_input_cache_key: tuple[object, ...] | None = None
         self._uniform_input_cache_value: bool = False
+        self._generic_projected_cache_key: tuple[object, ...] | None = None
+        self._generic_projected_args: tuple[
+            list[torch.Tensor],
+            list[torch.Tensor],
+            list[torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+        ] | None = None
         self._debug_reported: bool = False
 
     @property
     def backend_name(self) -> str:
+        if self._can_use_generic_projected_module():
+            return "hip_generic_projected_lstm"
         return self._backend_name
 
     def __getattr__(self, name: str) -> Any:
@@ -73,10 +83,92 @@ class NativeModuleFallback(nn.Module):
             module = super().__getattr__("module")
             return getattr(module, name)
 
+    def _can_use_generic_projected_module(self) -> bool:
+        mode = os.environ.get("PERSISTENT_LSTM_HIP_GENERIC_PROJECTED", "1").strip().lower()
+        if mode in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        module = self.module
+        if not hasattr(module, "lstm") or not hasattr(module, "linear"):
+            return False
+        lstm = module.lstm
+        linear = module.linear
+        if not isinstance(lstm, nn.LSTM) or not isinstance(linear, nn.Linear):
+            return False
+        ext = load_extension()
+        return (
+            ext is not None and
+            hasattr(ext, "persistent_lstm_regressor_forward_generic_projected") and
+            lstm.batch_first and
+            not lstm.bidirectional and
+            lstm.proj_size == 0 and
+            lstm.bias and
+            lstm.hidden_size <= 1024 and
+            linear.in_features == lstm.hidden_size
+        )
+
+    def _current_generic_projected_cache_key(self) -> tuple[object, ...]:
+        module = self.module
+        lstm = module.lstm
+        linear = module.linear
+        params: list[torch.Tensor] = []
+        for layer_idx in range(lstm.num_layers):
+            params.extend(
+                [
+                    getattr(lstm, f"weight_ih_l{layer_idx}"),
+                    getattr(lstm, f"weight_hh_l{layer_idx}"),
+                    getattr(lstm, f"bias_ih_l{layer_idx}"),
+                    getattr(lstm, f"bias_hh_l{layer_idx}"),
+                ]
+            )
+        params.extend([linear.weight, linear.bias])
+        key_parts: list[object] = []
+        for tensor in params:
+            key_parts.extend(
+                (
+                    id(tensor),
+                    tensor.device.type,
+                    tensor.device.index,
+                    str(tensor.dtype),
+                    tuple(tensor.size()),
+                    tuple(tensor.stride()),
+                    tensor._version,
+                )
+            )
+        return tuple(key_parts)
+
+    def _ensure_generic_projected_args(
+        self,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        cache_key = self._current_generic_projected_cache_key()
+        if self._generic_projected_cache_key != cache_key or self._generic_projected_args is None:
+            lstm = self.module.lstm
+            linear = self.module.linear
+            weight_ih: list[torch.Tensor] = []
+            weight_hh: list[torch.Tensor] = []
+            bias: list[torch.Tensor] = []
+            for layer_idx in range(lstm.num_layers):
+                weight_ih.append(getattr(lstm, f"weight_ih_l{layer_idx}").contiguous())
+                weight_hh.append(getattr(lstm, f"weight_hh_l{layer_idx}").contiguous())
+                bias.append(
+                    (
+                        getattr(lstm, f"bias_ih_l{layer_idx}") +
+                        getattr(lstm, f"bias_hh_l{layer_idx}")
+                    ).contiguous()
+                )
+            self._generic_projected_args = (
+                weight_ih,
+                weight_hh,
+                bias,
+                linear.weight.contiguous(),
+                linear.bias.contiguous(),
+            )
+            self._generic_projected_cache_key = cache_key
+        return self._generic_projected_args
+
     def _should_use_uniform_batch_fast_path(self, x: torch.Tensor) -> bool:
         if not self._enable_uniform_batch or self.training:
             return False
-        mode = os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_BATCH", "auto").strip().lower()
+        mode = os.environ.get("PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH", "0").strip().lower()
         if mode in {"0", "false", "no", "off", "disable", "disabled"}:
             return False
         if x.dim() != 3 or x.size(0) <= 1:
@@ -105,6 +197,36 @@ class NativeModuleFallback(nn.Module):
         return self._uniform_input_cache_value
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if (
+            len(args) == 1 and
+            not kwargs and
+            isinstance(args[0], torch.Tensor) and
+            self._can_use_generic_projected_module() and
+            args[0].is_cuda and
+            args[0].dtype == torch.float16 and
+            args[0].dim() == 3 and
+            not self.training
+        ):
+            ext = load_extension()
+            if ext is not None:
+                out = ext.persistent_lstm_regressor_forward_generic_projected(
+                    args[0],
+                    *self._ensure_generic_projected_args(),
+                )
+                if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
+                    print(
+                        "persistent_lstm_hip debug: "
+                        "backend=generic_projected, "
+                        f"batch={int(args[0].size(0))}, "
+                        f"seq_len={int(args[0].size(1))}, "
+                        f"input_size={int(args[0].size(2))}, "
+                        f"hidden_size={int(self.module.lstm.hidden_size)}, "
+                        f"num_layers={int(self.module.lstm.num_layers)}, "
+                        "uniform_batch_fast_path=False"
+                    )
+                    self._debug_reported = True
+                return out
+
         if (
             len(args) == 1 and
             not kwargs and

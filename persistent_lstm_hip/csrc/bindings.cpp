@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <pybind11/stl.h>
+#include <vector>
 
 torch::Tensor persistent_lstm4_forward(
     const torch::Tensor& x,
@@ -141,6 +143,14 @@ torch::Tensor persistent_lstm4_forward_monolithic(
 
 torch::Tensor repeat_first_row_hip(const torch::Tensor& input, int64_t output_batch_size);
 
+torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
+    const torch::Tensor& x,
+    const std::vector<torch::Tensor>& weight_ih,
+    const std::vector<torch::Tensor>& weight_hh,
+    const std::vector<torch::Tensor>& bias,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("persistent_lstm4_forward", &persistent_lstm4_forward, "Persistent LSTM 4-layer forward");
   m.def("persistent_lstm4_forward_packed", &persistent_lstm4_forward_packed, "Persistent LSTM 4-layer forward packed");
@@ -150,5 +160,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("persistent_lstm4_forward_projected_uniform_p4", &persistent_lstm4_forward_projected_uniform_p4_hip, "Persistent LSTM 4-layer forward projected uniform batch with partitioned recurrent dot");
   m.def("persistent_lstm4_forward_projected_uniform_p8", &persistent_lstm4_forward_projected_uniform_p8_hip, "Persistent LSTM 4-layer forward projected uniform batch with 8-way partitioned recurrent dot");
   m.def("persistent_lstm4_forward_monolithic", &persistent_lstm4_forward_monolithic, "Persistent LSTM 4-layer forward monolithic");
+  m.def("persistent_lstm_regressor_forward_generic_projected", &persistent_lstm_regressor_forward_generic_projected_hip, "Generic projected LSTM regressor forward");
   m.def("repeat_first_row", &repeat_first_row_hip, "Repeat the first row of a FP16 CUDA tensor");
 }
