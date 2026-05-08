@@ -1,0 +1,79 @@
+backend: hip_specialized_4layer_regressor[auto]
+accuracy_vs_native_lstm: max_abs=3.05176e-05, mean_abs=7.78834e-06, max_rel=0.00277521
+3.0837209224700928
+吞吐量(含batchsize): 16603.31829217161
+HIP_PROF:on Fri May  8 13:35:09 2026
+HIP_PROF:process id '156791'
+HIP_PROF:db file 'hip-prof-156791.db'
+HIP_PROF:out put file 'result_156791'
+HIP_PROF:profiling ' python LSTM-hip.py'
+HIP_PROF:process begin
+HIP_PROF:process end run total cost:11(s)
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+HIP_PROF:IP:[31m10.8.145.253[0m HIP API statistics
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|Name                                                          |Calls          |TotalDurationNs            |AverageNs                  |Percentage                 |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|hipDeviceSynchronize                                          |3              |3368477734                 |1122825911                 |75.6924437205338           |
+|hipModuleLoadData                                             |74             |503686213                  |6806570                    |11.3182402678489           |
+|hipModuleGetFunction                                          |5869           |288366902                  |49133                      |6.479839626127             |
+|hipModuleLoad                                                 |6              |83229812                   |13871635                   |1.87024180005478           |
+|hipModuleUnload                                               |78             |62519935                   |801537                     |1.40487396239352           |
+|hipMalloc                                                     |13             |57001146                   |4384703                    |1.28086226964234           |
+|hipExtModuleLaunchKernel                                      |8338           |41000534                   |4917                       |0.921315459794229          |
+|hipLaunchKernel                                               |977            |38067592                   |38963                      |0.855409859460346          |
+|hipMemcpyWithStream                                           |26             |2578261                    |99163                      |0.0579356288063109         |
+|hipDeviceGetAttribute                                         |4013           |1674594                    |417                        |0.0376294938275355         |
+|hipHostMalloc                                                 |2              |1296055                    |648027                     |0.0291234135692869         |
+|hipGetDevice                                                  |7406           |1171567                    |158                        |0.0263260666137847         |
+|hipSetDevice                                                  |2843           |434909                     |152                        |0.00977276016218834        |
+|__hipPopCallConfiguration                                     |977            |199299                     |203                        |0.00447841117926733        |
+|__hipPushCallConfiguration                                    |977            |189099                     |193                        |0.00424920885497806        |
+|hipGetLastError                                               |1049           |129720                     |123                        |0.00291491426537292        |
+|hipMemcpyAsync                                                |16             |78930                      |4933                       |0.00177362151530901        |
+|hipGetDeviceProperties                                        |24             |67500                      |2812                       |0.00151678008720839        |
+|hipMemsetAsync                                                |1              |17580                      |17580                      |0.000395036947157385       |
+|hipDevicePrimaryCtxGetState                                   |26             |14450                      |555                        |0.000324703292743129       |
+|hipStreamIsCapturing                                          |7              |8409                       |1201                       |0.000188957092642005       |
+|hipGetDeviceCount                                             |6              |4190                       |698                        |9.4152719487454e-05        |
+|hipDeviceGetStreamPriorityRange                               |1              |1140                       |1140                       |2.56167303617417e-05       |
+|hipInit                                                       |1              |1080                       |1080                       |2.42684813953342e-05       |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|Total                                                         |32733          |4450216651                 |135955                     |100.0                      |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+HIP_PROF:IP:[31m10.8.145.253[0m HIPOPS API statistics
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|Name                                                          |Calls          |TotalDurationNs            |AverageNs                  |Percentage                 |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|void (anonymous namespace)::persistent_lstm_projected_unifo...|222            |1685069980                 |7590405                    |48.101                     |
+|void (anonymous namespace)::persistent_lstm_projected_unifo...|111            |922372597                  |8309663                    |26.329                     |
+|void (anonymous namespace)::persistent_lstm_projected_unifo...|111            |817565814                  |7365457                    |23.338                     |
+|rnn_lstm_elemwise_fp16mix_seq_packed_fwd_naive                |3996           |31733735                   |7941                       |0.906                      |
+|Cijk_Alik_Bljk_HBH_MT32x32x16_SE_AMAS3_BL1_DRB16_ALT_KME0_E...|4000           |31411006                   |7852                       |0.897                      |
+|Cijk_Alik_Bljk_HBH_MT128x128x32_SE_AMAS3_BL1_DRB16_ALT_KME0...|4              |7855674                    |1963918                    |0.224                      |
+|Cijk_Alik_Bljk_HBH_MT64x64x16_SE_AMAS3_BL1_DRB16_ALT_KME0_E...|333            |3290237                    |9880                       |0.094                      |
+|void at::native::elementwise_kernel<128, 4, at::native::gpu...|333            |2368317                    |7112                       |0.068                      |
+|(anonymous namespace)::repeat_first_row_kernel(__half const...|111            |582559                     |5248                       |0.017                      |
+|void at::native::elementwise_kernel<128, 4, at::native::gpu...|26             |268160                     |10313                      |0.008                      |
+|void at::native::(anonymous namespace)::CatArrayBatchedCopy...|9              |137440                     |15271                      |0.004                      |
+|void at::native::elementwise_kernel<512, 1, at::native::gpu...|20             |99840                      |4992                       |0.003                      |
+|void at::native::(anonymous namespace)::CatArrayBatchedCopy...|8              |77280                      |9660                       |0.002                      |
+|void at::native::reduce_kernel<512, 1, at::native::ReduceOp...|1              |54400                      |54400                      |0.002                      |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|8              |59519                      |7439                       |0.002                      |
+|rnn_lstm_elemwise_fp16mix_seq_packed_fwd_h4_rm_th64           |4              |43520                      |10880                      |0.001                      |
+|void at::native::elementwise_kernel<128, 4, at::native::gpu...|1              |49440                      |49440                      |0.001                      |
+|void at::native::reduce_kernel<512, 1, at::native::ReduceOp...|1              |24480                      |24480                      |0.001                      |
+|void at::native::reduce_kernel<512, 1, at::native::ReduceOp...|2              |48320                      |24160                      |0.001                      |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|5              |38081                      |7616                       |0.001                      |
+|Cijk_Alik_Bljk_HBH_MT16x16x32_SE_AMAS3_BL1_DRB16_ALT_KME0_E...|1              |10720                      |10720                      |0.0                        |
+|void at::native::elementwise_kernel<512, 1, at::native::gpu...|3              |16640                      |5546                       |0.0                        |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|1              |5440                       |5440                       |0.0                        |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|2              |5760                       |2880                       |0.0                        |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|1              |5280                       |5280                       |0.0                        |
+|void at::native::vectorized_elementwise_kernel<4, at::nativ...|1              |8000                       |8000                       |0.0                        |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|Total                                                         |9315           |3503202239                 |376081                     |100.0                      |
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+HIP_PROF:dump perfetto trace (0/42106)HIP_PROF:dump perfetto trace (0/42106)HIP_PROF:dump perfetto trace (0/42106)HIP_PROF:dump perfetto trace (8183/42106)HIP_PROF:dump perfetto trace (8230/42106)HIP_PROF:dump perfetto trace (8271/42106)HIP_PROF:dump perfetto trace (8271/42106)HIP_PROF:dump perfetto trace (8271/42106)HIP_PROF:dump perfetto trace (16454/42106)HIP_PROF:dump perfetto trace (16454/42106)HIP_PROF:dump perfetto trace (19940/42106)HIP_PROF:dump perfetto trace (19940/42106)HIP_PROF:dump perfetto trace (19940/42106)HIP_PROF:dump perfetto trace (28123/42106)HIP_PROF:dump perfetto trace (28134/42106)HIP_PROF:dump perfetto trace (33022/42106)HIP_PROF:dump perfetto trace (33022/42106)HIP_PROF:dump perfetto trace (33022/42106)HIP_PROF:dump perfetto trace (41206/42106)HIP_PROF:dump perfetto trace (41206/42106)HIP_PROF:dump perfetto trace (42106/42106)
+HIP_PROF:finish
