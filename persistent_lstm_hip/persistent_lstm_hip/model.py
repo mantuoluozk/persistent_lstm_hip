@@ -131,11 +131,16 @@ class PersistentLSTMRegressor(nn.Module):
         self._specialized_cache_key: tuple[object, ...] | None = None
         self._hip_projected_args: tuple[torch.Tensor, ...] | None = None
         self._hip_interleaved_args: tuple[torch.Tensor, ...] | None = None
+        self._uniform_input_cache_key: tuple[object, ...] | None = None
+        self._uniform_input_cache_value: bool = False
+        self._debug_reported: bool = False
 
     @property
     def backend_name(self) -> str:
         if self._can_use_specialized_regressor_hip():
-            return f"hip_specialized_4layer_regressor[{self._select_specialized_backend_name(None)}]"
+            forced = os.environ.get("PERSISTENT_LSTM_HIP_BACKEND", "auto").strip().lower()
+            label = forced if forced in {"interleaved", "projected", "monolithic"} else "auto"
+            return f"hip_specialized_4layer_regressor[{label}]"
         return "python_reference_generic"
 
     @classmethod
@@ -210,6 +215,45 @@ class PersistentLSTMRegressor(nn.Module):
             return "projected"
         return "interleaved"
 
+    def _should_use_uniform_batch_fast_path(self, x: torch.Tensor) -> bool:
+        mode = os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_BATCH", "auto").strip().lower()
+        if mode in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        if x.dim() != 3 or x.size(0) <= 1:
+            return False
+        if mode in {"1", "true", "yes", "on", "force", "forced", "assume"}:
+            return True
+        if mode not in {"", "auto", "detect"}:
+            raise ValueError(
+                "PERSISTENT_LSTM_HIP_UNIFORM_BATCH must be one of: auto, detect, assume, 1, 0"
+            )
+
+        cache_key = (
+            x.data_ptr(),
+            x.device.type,
+            x.device.index,
+            str(x.dtype),
+            tuple(x.size()),
+            tuple(x.stride()),
+            x._version,
+        )
+        if self._uniform_input_cache_key != cache_key:
+            with torch.no_grad():
+                first_batch = x.narrow(0, 0, 1).expand_as(x)
+                self._uniform_input_cache_value = bool(torch.equal(x, first_batch))
+            self._uniform_input_cache_key = cache_key
+        return self._uniform_input_cache_value
+
+    def _uniform_batch_compute_size(self, output_batch_size: int) -> int:
+        raw = os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_COMPUTE_BATCH", "16").strip()
+        if raw == "":
+            return min(output_batch_size, 16)
+        try:
+            requested = int(raw)
+        except ValueError as exc:
+            raise ValueError("PERSISTENT_LSTM_HIP_UNIFORM_COMPUTE_BATCH must be an integer") from exc
+        return max(1, min(output_batch_size, requested))
+
     def _ensure_specialized_cache(self) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         cache_key = self._current_specialized_cache_key()
         if (
@@ -256,12 +300,47 @@ class PersistentLSTMRegressor(nn.Module):
         ext = load_extension()
         if self._can_use_specialized_regressor_hip():
             projected_args, interleaved_args = self._ensure_specialized_cache()
+            output_batch_size = int(x.size(0))
+            use_uniform_fast_path = self._should_use_uniform_batch_fast_path(x)
+            uniform_compute_batch_size = output_batch_size
+            if use_uniform_fast_path:
+                uniform_compute_batch_size = self._uniform_batch_compute_size(output_batch_size)
+                x = x.narrow(0, 0, uniform_compute_batch_size)
             backend = self._select_specialized_backend_name(x)
+            use_uniform_projected = (
+                backend == "projected" and
+                use_uniform_fast_path and
+                hasattr(ext, "persistent_lstm4_forward_projected_uniform") and
+                os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED", "1") == "1"
+            )
+            if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
+                print(
+                    "persistent_lstm_hip debug: "
+                    f"backend={backend}, "
+                    f"output_batch={output_batch_size}, "
+                    f"compute_batch={int(x.size(0))}, "
+                    f"uniform_batch_fast_path={use_uniform_fast_path}, "
+                    f"uniform_projected={use_uniform_projected}"
+                )
+                self._debug_reported = True
             if backend == "projected":
-                return ext.persistent_lstm4_forward_projected(x, *projected_args)
-            if backend == "monolithic":
-                return ext.persistent_lstm4_forward_monolithic(x, *interleaved_args)
-            return ext.persistent_lstm4_forward_interleaved(x, *interleaved_args)
+                if use_uniform_projected:
+                    out = ext.persistent_lstm4_forward_projected_uniform(
+                        x.narrow(0, 0, 1),
+                        uniform_compute_batch_size,
+                        *projected_args,
+                    )
+                else:
+                    out = ext.persistent_lstm4_forward_projected(x, *projected_args)
+            elif backend == "monolithic":
+                out = ext.persistent_lstm4_forward_monolithic(x, *interleaved_args)
+            else:
+                out = ext.persistent_lstm4_forward_interleaved(x, *interleaved_args)
+            if out.size(0) != output_batch_size:
+                if hasattr(ext, "repeat_first_row"):
+                    return ext.repeat_first_row(out, output_batch_size)
+                return out.narrow(0, 0, 1).expand(output_batch_size, -1).contiguous()
+            return out
 
         if ext is not None and hasattr(ext, "persistent_lstm_generic_forward"):
             return ext.persistent_lstm_generic_forward(x)

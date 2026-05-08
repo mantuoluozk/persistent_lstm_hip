@@ -44,15 +44,35 @@ def maybe_convert_backend(model: nn.Module) -> nn.Module:
     return convert_regressor_module(model)
 
 
+def report_accuracy_gap(native_model: nn.Module, candidate_model: nn.Module, x: torch.Tensor) -> None:
+    if os.environ.get("PERSISTENT_LSTM_HIP_ACCURACY", "1") != "1":
+        return
+
+    with torch.inference_mode():
+        native_out = native_model(x)
+        candidate_out = candidate_model(x)
+    torch.cuda.synchronize()
+
+    diff = (candidate_out.float() - native_out.float()).abs()
+    denom = native_out.float().abs().clamp_min(1.0e-6)
+    rel = diff / denom
+    print(
+        "accuracy_vs_native_lstm: "
+        f"max_abs={diff.max().item():.6g}, "
+        f"mean_abs={diff.mean().item():.6g}, "
+        f"max_rel={rel.max().item():.6g}"
+    )
+
+
 def main() -> None:
-    model = LSTMRegressor(
+    native_model = LSTMRegressor(
         input_dim=5,
         hidden_dim=128,
         output_dim=24,
         n_layers=4,
     ).to("cuda:0").half().eval()
 
-    model = maybe_convert_backend(model).to("cuda:0").half().eval()
+    model = maybe_convert_backend(native_model).to("cuda:0").half().eval()
 
     seq_length = 1000
     batch_size = 512
@@ -63,6 +83,7 @@ def main() -> None:
 
     backend_name = getattr(model, "backend_name", "native_pytorch")
     print(f"backend: {backend_name}")
+    report_accuracy_gap(native_model, model, x)
 
     for _ in range(10):
         _ = model(x)
