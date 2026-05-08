@@ -1429,6 +1429,29 @@ __global__ void linear_head_kernel(
   out[b * kOutputSize + o] = float_to_half(acc);
 }
 
+__global__ void linear_head_dynamic_kernel(
+    const gpu_half* __restrict__ last,
+    const gpu_half* __restrict__ linear_weight,
+    const gpu_half* __restrict__ linear_bias,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int hidden_size,
+    int output_size) {
+  const int b = blockIdx.x;
+  const int o = threadIdx.x;
+  if (b >= batch_size || o >= output_size) {
+    return;
+  }
+
+  float acc = half_to_float(linear_bias[o]);
+  const int last_base = b * hidden_size;
+  const int weight_base = o * hidden_size;
+  for (int h = 0; h < hidden_size; ++h) {
+    acc += half_to_float(last[last_base + h]) * half_to_float(linear_weight[weight_base + h]);
+  }
+  out[b * output_size + o] = float_to_half(acc);
+}
+
 __global__ void repeat_first_row_kernel(
     const gpu_half* __restrict__ input,
     gpu_half* __restrict__ output,
@@ -1525,6 +1548,53 @@ torch::Tensor linear_head_hip(
       reinterpret_cast<const gpu_half*>(bias_c.data_ptr<at::Half>()),
       reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
       batch_size);
+  check_last_error();
+  return out;
+}
+
+torch::Tensor linear_head_dynamic_hip(
+    const torch::Tensor& last,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (!(last.scalar_type() == torch::kFloat16 &&
+        last.dim() == 2 &&
+        linear_weight.scalar_type() == torch::kFloat16 &&
+        linear_weight.dim() == 2 &&
+        linear_bias.scalar_type() == torch::kFloat16 &&
+        linear_bias.dim() == 1 &&
+        linear_weight.size(1) == last.size(1) &&
+        linear_bias.size(0) == linear_weight.size(0) &&
+        linear_weight.size(0) <= 1024)) {
+    return torch::matmul(last, linear_weight.transpose(0, 1)) + linear_bias;
+  }
+
+  auto last_c = last.contiguous();
+  auto weight_c = linear_weight.contiguous();
+  auto bias_c = linear_bias.contiguous();
+  const int batch_size = static_cast<int>(last_c.size(0));
+  const int hidden_size = static_cast<int>(last_c.size(1));
+  const int output_size = static_cast<int>(weight_c.size(0));
+  auto out = torch::empty({batch_size, output_size}, last_c.options());
+
+  int threads = 1;
+  while (threads < output_size) {
+    threads <<= 1;
+  }
+  threads = std::min(threads, 1024);
+
+  GPU_LAUNCH_KERNEL(
+      linear_head_dynamic_kernel,
+      batch_size,
+      threads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(last_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(weight_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(bias_c.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
+      batch_size,
+      hidden_size,
+      output_size);
   check_last_error();
   return out;
 }
@@ -2787,7 +2857,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
       layer_input = layer_out;
       input_size = hidden_size;
     } else {
-      return torch::matmul(layer_out, linear_weight.contiguous().transpose(0, 1)) + linear_bias.contiguous();
+      return linear_head_dynamic_hip(layer_out, linear_weight, linear_bias);
     }
   }
 
