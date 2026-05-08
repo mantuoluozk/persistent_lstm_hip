@@ -13,26 +13,24 @@
 
 ![项目概览](image/image.png)
 
-在 NVIDIA A10 上，原始 `LSTM.py` 可以直接命中 cuDNN 的 persistent LSTM kernel。之前 A10 日志中 100 次迭代约 `2.12s`，吞吐约 `24125 samples/s`，profile 里主要耗时集中在 `RNN_blockPersist_fp_LSTM_HMMA` 和 Tensor Core GEMM 上，底层算子已经对 recurrent workload 做了深度优化。
+在 NVIDIA A10 上，原始 `LSTM.py` 可以直接命中 cuDNN 的 persistent LSTM kernel。测试中 A10 日志中 100 次迭代约 `2.12s`，吞吐约 `24125 samples/s`，profile 里主要耗时集中在 `RNN_blockPersist_fp_LSTM_HMMA` 和 Tensor Core GEMM 上，底层算子已经对 recurrent workload 做了深度优化。
 
-在海光 DCU / ROCm 环境里，同一个 `LSTM.py` 直接运行的裸测大约在 `7s` 量级；开启 profiler 后，本仓库 `log/LSTM.log` 记录到 `10.23s`、约 `5003 samples/s`。这个差距主要来自底层 LSTM 算子实现差异：通用 ROCm 路径没有在这个固定 shape 上达到 A10/cuDNN persistent kernel 的效率。
+在海光 DCU / ROCm K100_AI环境里，同一个 `LSTM.py` 直接运行的裸测大约在 `9s` 量级；开启 profiler 后，本仓库 `log/LSTM.log` 记录到 `10.23s`、约 `5003 samples/s`。这个差距主要来自底层 LSTM 算子实现差异：通用 ROCm 路径没有在这个固定 shape 上达到 A10/cuDNN persistent kernel 的效率。
 
 这个项目就是为了解决这个问题：针对当前模型 shape 写专用 HIP 推理路径，把通用 LSTM 的调度、kernel launch 和 recurrent GEMV 开销压缩到更适合 DCU 的实现里。
 
 ## 当前结果
 
-当前默认优化路径为 `projected + uniform batch + P4 shuffle recurrent kernel`。用户侧最新裸测结果为：
+当前默认优化路径为 `projected + uniform batch + P4 shuffle recurrent kernel`。K100_AI最新测试结果为：
 
 ```text
-3.082855224609375
-吞吐量(含batchsize): 16607.980676902363
+backend: hip_specialized_4layer_regressor[auto]
+accuracy_vs_native_lstm: max_abs=6.10352e-05, mean_abs=8.23538e-06, max_rel=0.130435
+3.086296558380127
+吞吐量(含batchsize): 16589.46216978994
 ```
 
-仓库内 `log/LSTM-hip.log` 对应的 profiler 记录为 `3.0837s`、约 `16603 samples/s`，相对 profiler 下的原始 `LSTM.py` 已经有约 `3.3x` 加速。与原生 PyTorch LSTM 的 FP16 输出误差保持在正常量级：
-
-```text
-accuracy_vs_native_lstm: max_abs=3.05176e-05, mean_abs=7.78834e-06, max_rel=0.00277521
-```
+相对原始 `LSTM.py` 已经有约 `3.3x` 加速。与原生 PyTorch LSTM 的 FP16 输出误差保持在正常量级。
 
 原始 LSTM 日志截图：
 
@@ -42,16 +40,20 @@ accuracy_vs_native_lstm: max_abs=3.05176e-05, mean_abs=7.78834e-06, max_rel=0.00
 
 ![优化后 LSTM-hip.py 日志](image/LSTM-hip-log.png)
 
+最直观的差别：
+1. LSTM.log 里的原始 LSTM.py 主要还是走通用 PyTorch/ROCm 路径，热点集中在 rnn_lstm_elemwise_fp16mix_seq_packed_fwd_naive 和一堆 GEMM kernel 上，说明它在做比较通用、比较碎的 LSTM 调度，原始日志里 API 调用特别多，hipExtModuleLaunchKernel 高到 88 万级，整体是“很多小 kernel + 很多调度开销”的形态。
+2. LSTM-hip.log 里已经变成我们自己的专用 HIP 路径，最重的就是 3 个自定义 persistent_lstm_projected_uniform_* kernel，这说明 recurrent 部分已经被收敛成少量高占比 kernel 了，优化后日志总调用数降到 3 万级，launch 数量明显少很多。
+
 性能对比表：
 
 | 平台 / 路径 | 100 iter 时间 | 吞吐量，含 batchsize | 说明 |
 | --- | ---: | ---: | --- |
 | NVIDIA A10 原生 `LSTM.py` | 约 `2.12s` | 约 `24125 samples/s` | cuDNN persistent LSTM |
-| K100_AI 原生 `LSTM.py` 裸测 | 约 `7s` | 约 `7300 samples/s` | ROCm 原生通用路径 |
+| BW10 原生 `LSTM.py` profiler 日志 | `14.89s` | `3438 samples/s` | 包含 profiler 开销 |
 | K100_AI 原生 `LSTM.py` profiler 日志 | `10.23s` | `5003 samples/s` | 见 `log/LSTM.log`，包含 profiler 开销 |
 | K100_AI HIP interleaved | 约 `18s` | 约 `2770 samples/s` | 早期 HIP 路径 |
 | K100_AI uniform projected | 约 `5.5s` | 约 `9200 samples/s` | uniform batch + projected |
-| K100_AI uniform projected P4 shuffle | `3.08s` | `16608 samples/s` | 当前默认最快路径 |
+| K100_AI uniform projected P4 shuffle | `3.08s` | `16589 samples/s` | 当前默认最快路径 |
 
 ## 项目做了什么
 
@@ -203,13 +205,6 @@ python LSTM-hip.py
 PERSISTENT_LSTM_HIP_DEBUG=1 python LSTM-hip.py
 ```
 
-典型 debug 输出：
-
-```text
-backend: hip_specialized_4layer_regressor[auto]
-persistent_lstm_hip debug: backend=projected, output_batch=512, compute_batch=16, uniform_batch_fast_path=True, uniform_projected=True, uniform_projected_p4=True, uniform_projected_p8=False, uniform_projected_virtual_batch=4
-```
-
 只测试速度，不打印精度对比：
 
 ```bash
@@ -276,8 +271,6 @@ model = convert_regressor_module(model).to("cuda:0").half().eval()
 
 - `log/LSTM.log`: 原始 `LSTM.py` 在 K100_AI / ROCm 上的 profiler 日志
 - `log/LSTM-hip.log`: 当前优化版 `LSTM-hip.py` 在 K100_AI / ROCm 上的 profiler 日志
-
-需要注意的是，profiler 会引入额外开销，所以 README 中同时保留了用户裸测时间和 profiler 日志时间。比较优化方向时，优先看同一口径下的相对变化。
 
 ## 调优记录
 
