@@ -28,6 +28,10 @@ namespace {
 constexpr int kHiddenSize = 128;
 constexpr int kInputSize = 5;
 constexpr int kThreads = 128;
+constexpr int kPartitionedThreads = 512;
+constexpr int kRecurrentPartitions = 4;
+constexpr int kP8PartitionedThreads = 1024;
+constexpr int kP8RecurrentPartitions = 8;
 constexpr int kWaveThreads = 64;
 constexpr int kGateCols = 4 * kHiddenSize;
 constexpr int kHiddenPairs = kHiddenSize / 2;
@@ -43,6 +47,22 @@ __device__ inline float half_to_float(gpu_half v) {
 
 __device__ inline gpu_half float_to_half(float v) {
   return __float2half(v);
+}
+
+__device__ inline float shfl_down_float(float v, int delta) {
+#ifdef __HIP_PLATFORM_AMD__
+  return __shfl_down(v, delta);
+#else
+  return __shfl_down_sync(0xffffffff, v, delta);
+#endif
+}
+
+template <int Partitions>
+__device__ inline float reduce_partition_sum(float v) {
+  for (int offset = 1; offset < Partitions; offset <<= 1) {
+    v += shfl_down_float(v, offset);
+  }
+  return v;
 }
 
 __device__ inline void accumulate_packed_pairs(
@@ -151,6 +171,34 @@ __device__ inline void accumulate_cached_recurrent(
     f_acc += v0 * half_to_float(hh_cache[cache_base + 2]) + v1 * half_to_float(hh_cache[cache_base + 3]);
     g_acc += v0 * half_to_float(hh_cache[cache_base + 4]) + v1 * half_to_float(hh_cache[cache_base + 5]);
     o_acc += v0 * half_to_float(hh_cache[cache_base + 6]) + v1 * half_to_float(hh_cache[cache_base + 7]);
+  }
+}
+
+template <int Partitions>
+__device__ inline void accumulate_recurrent_partition(
+    const gpu_half* __restrict__ h_values,
+    const gpu_half* __restrict__ weights_packed,
+    int out_idx,
+    int partition,
+    float& i_acc,
+    float& f_acc,
+    float& g_acc,
+    float& o_acc) {
+  const int col_base = out_idx * 2;
+  for (int pair_idx = partition; pair_idx < kHiddenPairs; pair_idx += Partitions) {
+    const int k0 = pair_idx * 2;
+    const int k1 = k0 + 1;
+    const float v0 = half_to_float(h_values[k0]);
+    const float v1 = half_to_float(h_values[k1]);
+    const int pair_base = pair_idx * (kGateCols * 2);
+    i_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base + 0]) +
+             v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base + 1]);
+    f_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base + 0]) +
+             v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base + 1]);
+    g_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base + 0]) +
+             v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base + 1]);
+    o_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base + 0]) +
+             v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base + 1]);
   }
 }
 
@@ -821,6 +869,121 @@ __global__ void persistent_lstm_projected_uniform_full_kernel(
   }
 }
 
+__global__ void persistent_lstm_projected_uniform_l0_full_kernel(
+    const gpu_half* __restrict__ x,
+    const gpu_half* __restrict__ weight_ih,
+    const gpu_half* __restrict__ weight_hh_packed,
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ out,
+    int virtual_batch_size,
+    int seq_len) {
+  const int virtual_b = blockIdx.x;
+  const int h = threadIdx.x;
+  if (virtual_b >= virtual_batch_size || h >= kHiddenSize) {
+    return;
+  }
+
+  __shared__ gpu_half h_cur[kHiddenSize];
+  gpu_half hh_cache[kHiddenPairs * 8];
+  float c_reg = 0.0f;
+
+  h_cur[h] = float_to_half(0.0f);
+  load_recurrent_cache_for_thread(weight_hh_packed, h, hh_cache);
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    const int x_base = t * kInputSize;
+    float i_acc = half_to_float(bias[0 * kHiddenSize + h]);
+    float f_acc = half_to_float(bias[1 * kHiddenSize + h]);
+    float g_acc = half_to_float(bias[2 * kHiddenSize + h]);
+    float o_acc = half_to_float(bias[3 * kHiddenSize + h]);
+    #pragma unroll
+    for (int k = 0; k < kInputSize; ++k) {
+      const float xv = half_to_float(x[x_base + k]);
+      i_acc += xv * half_to_float(weight_ih[(0 * kHiddenSize + h) * kInputSize + k]);
+      f_acc += xv * half_to_float(weight_ih[(1 * kHiddenSize + h) * kInputSize + k]);
+      g_acc += xv * half_to_float(weight_ih[(2 * kHiddenSize + h) * kInputSize + k]);
+      o_acc += xv * half_to_float(weight_ih[(3 * kHiddenSize + h) * kInputSize + k]);
+    }
+    accumulate_cached_recurrent(h_cur, hh_cache, i_acc, f_acc, g_acc, o_acc);
+
+    const float i_gate = sigmoidf_fast(i_acc);
+    const float f_gate = sigmoidf_fast(f_acc);
+    const float g_gate = tanhf(g_acc);
+    const float o_gate = sigmoidf_fast(o_acc);
+    c_reg = f_gate * c_reg + i_gate * g_gate;
+    h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+    if (virtual_b == 0) {
+      out[t * kHiddenSize + h] = h_cur[h];
+    }
+    __syncthreads();
+  }
+}
+
+template <int Partitions, int Threads>
+__global__ void __launch_bounds__(Threads) persistent_lstm_projected_uniform_l0_full_partitioned_kernel(
+    const gpu_half* __restrict__ x,
+    const gpu_half* __restrict__ weight_ih,
+    const gpu_half* __restrict__ weight_hh_packed,
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ out,
+    int virtual_batch_size,
+    int seq_len) {
+  const int virtual_b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int h = tid / Partitions;
+  const int partition = tid % Partitions;
+  if (virtual_b >= virtual_batch_size || h >= kHiddenSize) {
+    return;
+  }
+
+  __shared__ gpu_half h_cur[kHiddenSize];
+  float c_reg = 0.0f;
+
+  if (partition == 0) {
+    h_cur[h] = float_to_half(0.0f);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    float i_acc = 0.0f;
+    float f_acc = 0.0f;
+    float g_acc = 0.0f;
+    float o_acc = 0.0f;
+    accumulate_recurrent_partition<Partitions>(h_cur, weight_hh_packed, h, partition, i_acc, f_acc, g_acc, o_acc);
+    const float i_recur = reduce_partition_sum<Partitions>(i_acc);
+    const float f_recur = reduce_partition_sum<Partitions>(f_acc);
+    const float g_recur = reduce_partition_sum<Partitions>(g_acc);
+    const float o_recur = reduce_partition_sum<Partitions>(o_acc);
+
+    if (partition == 0) {
+      const int x_base = t * kInputSize;
+      float i_sum = half_to_float(bias[0 * kHiddenSize + h]) + i_recur;
+      float f_sum = half_to_float(bias[1 * kHiddenSize + h]) + f_recur;
+      float g_sum = half_to_float(bias[2 * kHiddenSize + h]) + g_recur;
+      float o_sum = half_to_float(bias[3 * kHiddenSize + h]) + o_recur;
+      #pragma unroll
+      for (int k = 0; k < kInputSize; ++k) {
+        const float xv = half_to_float(x[x_base + k]);
+        i_sum += xv * half_to_float(weight_ih[(0 * kHiddenSize + h) * kInputSize + k]);
+        f_sum += xv * half_to_float(weight_ih[(1 * kHiddenSize + h) * kInputSize + k]);
+        g_sum += xv * half_to_float(weight_ih[(2 * kHiddenSize + h) * kInputSize + k]);
+        o_sum += xv * half_to_float(weight_ih[(3 * kHiddenSize + h) * kInputSize + k]);
+      }
+      const float i_gate = sigmoidf_fast(i_sum);
+      const float f_gate = sigmoidf_fast(f_sum);
+      const float g_gate = tanhf(g_sum);
+      const float o_gate = sigmoidf_fast(o_sum);
+      c_reg = f_gate * c_reg + i_gate * g_gate;
+      h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+      if (virtual_b == 0) {
+        out[t * kHiddenSize + h] = h_cur[h];
+      }
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void persistent_lstm_projected_uniform_last_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh_packed,
@@ -860,6 +1023,173 @@ __global__ void persistent_lstm_projected_uniform_last_kernel(
 
   if (virtual_b == 0) {
     out[h] = h_cur[h];
+  }
+}
+
+template <int Partitions, int Threads>
+__global__ void __launch_bounds__(Threads) persistent_lstm_projected_uniform_full_partitioned_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh_packed,
+    gpu_half* __restrict__ out,
+    int virtual_batch_size,
+    int seq_len) {
+  const int virtual_b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int h = tid / Partitions;
+  const int partition = tid % Partitions;
+  if (virtual_b >= virtual_batch_size || h >= kHiddenSize) {
+    return;
+  }
+
+  __shared__ gpu_half h_cur[kHiddenSize];
+  float c_reg = 0.0f;
+
+  if (partition == 0) {
+    h_cur[h] = float_to_half(0.0f);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    float i_acc = 0.0f;
+    float f_acc = 0.0f;
+    float g_acc = 0.0f;
+    float o_acc = 0.0f;
+    accumulate_recurrent_partition<Partitions>(h_cur, weight_hh_packed, h, partition, i_acc, f_acc, g_acc, o_acc);
+    const float i_recur = reduce_partition_sum<Partitions>(i_acc);
+    const float f_recur = reduce_partition_sum<Partitions>(f_acc);
+    const float g_recur = reduce_partition_sum<Partitions>(g_acc);
+    const float o_recur = reduce_partition_sum<Partitions>(o_acc);
+
+    if (partition == 0) {
+      const int gate_base = t * kGateCols;
+      float i_sum = half_to_float(gate_proj[gate_base + 0 * kHiddenSize + h]) + i_recur;
+      float f_sum = half_to_float(gate_proj[gate_base + 1 * kHiddenSize + h]) + f_recur;
+      float g_sum = half_to_float(gate_proj[gate_base + 2 * kHiddenSize + h]) + g_recur;
+      float o_sum = half_to_float(gate_proj[gate_base + 3 * kHiddenSize + h]) + o_recur;
+      const float i_gate = sigmoidf_fast(i_sum);
+      const float f_gate = sigmoidf_fast(f_sum);
+      const float g_gate = tanhf(g_sum);
+      const float o_gate = sigmoidf_fast(o_sum);
+      c_reg = f_gate * c_reg + i_gate * g_gate;
+      h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+      if (virtual_b == 0) {
+        out[t * kHiddenSize + h] = h_cur[h];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void persistent_lstm_projected_uniform_last_linear_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh_packed,
+    const gpu_half* __restrict__ linear_weight,
+    const gpu_half* __restrict__ linear_bias,
+    gpu_half* __restrict__ out,
+    int virtual_batch_size,
+    int seq_len) {
+  const int virtual_b = blockIdx.x;
+  const int h = threadIdx.x;
+  if (virtual_b >= virtual_batch_size || h >= kHiddenSize) {
+    return;
+  }
+
+  __shared__ gpu_half h_cur[kHiddenSize];
+  gpu_half hh_cache[kHiddenPairs * 8];
+  float c_reg = 0.0f;
+
+  h_cur[h] = float_to_half(0.0f);
+  load_recurrent_cache_for_thread(weight_hh_packed, h, hh_cache);
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    const int gate_base = t * kGateCols;
+    float i_acc = half_to_float(gate_proj[gate_base + 0 * kHiddenSize + h]);
+    float f_acc = half_to_float(gate_proj[gate_base + 1 * kHiddenSize + h]);
+    float g_acc = half_to_float(gate_proj[gate_base + 2 * kHiddenSize + h]);
+    float o_acc = half_to_float(gate_proj[gate_base + 3 * kHiddenSize + h]);
+    accumulate_cached_recurrent(h_cur, hh_cache, i_acc, f_acc, g_acc, o_acc);
+
+    const float i_gate = sigmoidf_fast(i_acc);
+    const float f_gate = sigmoidf_fast(f_acc);
+    const float g_gate = tanhf(g_acc);
+    const float o_gate = sigmoidf_fast(o_acc);
+    c_reg = f_gate * c_reg + i_gate * g_gate;
+    h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+    __syncthreads();
+  }
+
+  if (virtual_b == 0 && h < kOutputSize) {
+    float acc = half_to_float(linear_bias[h]);
+    const int weight_base = h * kHiddenSize;
+    #pragma unroll 8
+    for (int k = 0; k < kHiddenSize; ++k) {
+      acc += half_to_float(h_cur[k]) * half_to_float(linear_weight[weight_base + k]);
+    }
+    out[h] = float_to_half(acc);
+  }
+}
+
+template <int Partitions, int Threads>
+__global__ void __launch_bounds__(Threads) persistent_lstm_projected_uniform_last_linear_partitioned_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh_packed,
+    const gpu_half* __restrict__ linear_weight,
+    const gpu_half* __restrict__ linear_bias,
+    gpu_half* __restrict__ out,
+    int virtual_batch_size,
+    int seq_len) {
+  const int virtual_b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int h = tid / Partitions;
+  const int partition = tid % Partitions;
+  if (virtual_b >= virtual_batch_size || h >= kHiddenSize) {
+    return;
+  }
+
+  __shared__ gpu_half h_cur[kHiddenSize];
+  float c_reg = 0.0f;
+
+  if (partition == 0) {
+    h_cur[h] = float_to_half(0.0f);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    float i_acc = 0.0f;
+    float f_acc = 0.0f;
+    float g_acc = 0.0f;
+    float o_acc = 0.0f;
+    accumulate_recurrent_partition<Partitions>(h_cur, weight_hh_packed, h, partition, i_acc, f_acc, g_acc, o_acc);
+    const float i_recur = reduce_partition_sum<Partitions>(i_acc);
+    const float f_recur = reduce_partition_sum<Partitions>(f_acc);
+    const float g_recur = reduce_partition_sum<Partitions>(g_acc);
+    const float o_recur = reduce_partition_sum<Partitions>(o_acc);
+
+    if (partition == 0) {
+      const int gate_base = t * kGateCols;
+      float i_sum = half_to_float(gate_proj[gate_base + 0 * kHiddenSize + h]) + i_recur;
+      float f_sum = half_to_float(gate_proj[gate_base + 1 * kHiddenSize + h]) + f_recur;
+      float g_sum = half_to_float(gate_proj[gate_base + 2 * kHiddenSize + h]) + g_recur;
+      float o_sum = half_to_float(gate_proj[gate_base + 3 * kHiddenSize + h]) + o_recur;
+      const float i_gate = sigmoidf_fast(i_sum);
+      const float f_gate = sigmoidf_fast(f_sum);
+      const float g_gate = tanhf(g_sum);
+      const float o_gate = sigmoidf_fast(o_sum);
+      c_reg = f_gate * c_reg + i_gate * g_gate;
+      h_cur[h] = float_to_half(o_gate * tanhf(c_reg));
+    }
+    __syncthreads();
+  }
+
+  if (virtual_b == 0 && tid < kOutputSize) {
+    float acc = half_to_float(linear_bias[tid]);
+    const int weight_base = tid * kHiddenSize;
+    #pragma unroll 8
+    for (int k = 0; k < kHiddenSize; ++k) {
+      acc += half_to_float(h_cur[k]) * half_to_float(linear_weight[weight_base + k]);
+    }
+    out[tid] = float_to_half(acc);
   }
 }
 
@@ -1683,18 +2013,18 @@ torch::Tensor persistent_lstm4_forward_projected_uniform_hip(
 
   const int64_t seq_len = x_c.size(1);
   const int virtual_blocks = static_cast<int>(std::min<int64_t>(virtual_batch_size, 1024));
-  auto x_2d = x_c.view({seq_len, kInputSize});
-  auto gate0 = (torch::matmul(x_2d, wih0.transpose(0, 1)) + b0).contiguous();
   auto seq0 = torch::empty({seq_len, kHiddenSize}, x_c.options());
 
   GPU_LAUNCH_KERNEL(
-      persistent_lstm_projected_uniform_full_kernel,
+      persistent_lstm_projected_uniform_l0_full_kernel,
       virtual_blocks,
       kThreads,
       0,
       0,
-      reinterpret_cast<const gpu_half*>(gate0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(x_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih0.data_ptr<at::Half>()),
       reinterpret_cast<const gpu_half*>(whh0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b0.data_ptr<at::Half>()),
       reinterpret_cast<gpu_half*>(seq0.data_ptr<at::Half>()),
       virtual_blocks,
       static_cast<int>(seq_len));
@@ -1731,21 +2061,297 @@ torch::Tensor persistent_lstm4_forward_projected_uniform_hip(
   check_last_error();
 
   auto gate3 = (torch::matmul(seq2, wih3.transpose(0, 1)) + b3).contiguous();
-  auto last = torch::empty({1, kHiddenSize}, x_c.options());
+  auto lw = linear_weight.contiguous();
+  auto lb = linear_bias.contiguous();
+  auto out = torch::empty({1, kOutputSize}, x_c.options());
   GPU_LAUNCH_KERNEL(
-      persistent_lstm_projected_uniform_last_kernel,
+      persistent_lstm_projected_uniform_last_linear_kernel,
       virtual_blocks,
       kThreads,
       0,
       0,
       reinterpret_cast<const gpu_half*>(gate3.data_ptr<at::Half>()),
       reinterpret_cast<const gpu_half*>(whh3.data_ptr<at::Half>()),
-      reinterpret_cast<gpu_half*>(last.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lw.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lb.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
       virtual_blocks,
       static_cast<int>(seq_len));
   check_last_error();
 
-  return linear_head_hip(last, linear_weight, linear_bias);
+  return out;
+}
+
+torch::Tensor persistent_lstm4_forward_projected_uniform_p4_hip(
+    const torch::Tensor& x,
+    int64_t virtual_batch_size,
+    const torch::Tensor& weight_ih_l0,
+    const torch::Tensor& weight_hh_l0_packed,
+    const torch::Tensor& bias_l0,
+    const torch::Tensor& weight_ih_l1,
+    const torch::Tensor& weight_hh_l1_packed,
+    const torch::Tensor& bias_l1,
+    const torch::Tensor& weight_ih_l2,
+    const torch::Tensor& weight_hh_l2_packed,
+    const torch::Tensor& bias_l2,
+    const torch::Tensor& weight_ih_l3,
+    const torch::Tensor& weight_hh_l3_packed,
+    const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (virtual_batch_size <= 0 || x.dim() != 3 || x.size(0) != 1 ||
+      !can_use_projected_kernel(
+          x,
+          weight_ih_l0,
+          weight_hh_l0_packed,
+          bias_l0,
+          weight_ih_l1,
+          weight_hh_l1_packed,
+          bias_l1,
+          weight_ih_l2,
+          weight_hh_l2_packed,
+          bias_l2,
+          weight_ih_l3,
+          weight_hh_l3_packed,
+          bias_l3)) {
+    return persistent_lstm4_forward_projected_uniform_hip(
+        x,
+        virtual_batch_size,
+        weight_ih_l0,
+        weight_hh_l0_packed,
+        bias_l0,
+        weight_ih_l1,
+        weight_hh_l1_packed,
+        bias_l1,
+        weight_ih_l2,
+        weight_hh_l2_packed,
+        bias_l2,
+        weight_ih_l3,
+        weight_hh_l3_packed,
+        bias_l3,
+        linear_weight,
+        linear_bias);
+  }
+
+  auto x_c = x.contiguous();
+  auto wih0 = weight_ih_l0.contiguous();
+  auto whh0 = weight_hh_l0_packed.contiguous();
+  auto b0 = bias_l0.contiguous();
+  auto wih1 = weight_ih_l1.contiguous();
+  auto whh1 = weight_hh_l1_packed.contiguous();
+  auto b1 = bias_l1.contiguous();
+  auto wih2 = weight_ih_l2.contiguous();
+  auto whh2 = weight_hh_l2_packed.contiguous();
+  auto b2 = bias_l2.contiguous();
+  auto wih3 = weight_ih_l3.contiguous();
+  auto whh3 = weight_hh_l3_packed.contiguous();
+  auto b3 = bias_l3.contiguous();
+  auto lw = linear_weight.contiguous();
+  auto lb = linear_bias.contiguous();
+
+  const int64_t seq_len = x_c.size(1);
+  const int virtual_blocks = static_cast<int>(std::min<int64_t>(virtual_batch_size, 1024));
+  auto seq0 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_l0_full_partitioned_kernel<kRecurrentPartitions, kPartitionedThreads>),
+      virtual_blocks,
+      kPartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(x_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b0.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq0.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate1 = (torch::matmul(seq0, wih1.transpose(0, 1)) + b1).contiguous();
+  auto seq1 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_full_partitioned_kernel<kRecurrentPartitions, kPartitionedThreads>),
+      virtual_blocks,
+      kPartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate1.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh1.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq1.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate2 = (torch::matmul(seq1, wih2.transpose(0, 1)) + b2).contiguous();
+  auto seq2 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_full_partitioned_kernel<kRecurrentPartitions, kPartitionedThreads>),
+      virtual_blocks,
+      kPartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate2.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh2.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq2.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate3 = (torch::matmul(seq2, wih3.transpose(0, 1)) + b3).contiguous();
+  auto out = torch::empty({1, kOutputSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_last_linear_partitioned_kernel<kRecurrentPartitions, kPartitionedThreads>),
+      virtual_blocks,
+      kPartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lw.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lb.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  return out;
+}
+
+torch::Tensor persistent_lstm4_forward_projected_uniform_p8_hip(
+    const torch::Tensor& x,
+    int64_t virtual_batch_size,
+    const torch::Tensor& weight_ih_l0,
+    const torch::Tensor& weight_hh_l0_packed,
+    const torch::Tensor& bias_l0,
+    const torch::Tensor& weight_ih_l1,
+    const torch::Tensor& weight_hh_l1_packed,
+    const torch::Tensor& bias_l1,
+    const torch::Tensor& weight_ih_l2,
+    const torch::Tensor& weight_hh_l2_packed,
+    const torch::Tensor& bias_l2,
+    const torch::Tensor& weight_ih_l3,
+    const torch::Tensor& weight_hh_l3_packed,
+    const torch::Tensor& bias_l3,
+    const torch::Tensor& linear_weight,
+    const torch::Tensor& linear_bias) {
+  if (virtual_batch_size <= 0 || x.dim() != 3 || x.size(0) != 1 ||
+      !can_use_projected_kernel(
+          x,
+          weight_ih_l0,
+          weight_hh_l0_packed,
+          bias_l0,
+          weight_ih_l1,
+          weight_hh_l1_packed,
+          bias_l1,
+          weight_ih_l2,
+          weight_hh_l2_packed,
+          bias_l2,
+          weight_ih_l3,
+          weight_hh_l3_packed,
+          bias_l3)) {
+    return persistent_lstm4_forward_projected_uniform_p4_hip(
+        x,
+        virtual_batch_size,
+        weight_ih_l0,
+        weight_hh_l0_packed,
+        bias_l0,
+        weight_ih_l1,
+        weight_hh_l1_packed,
+        bias_l1,
+        weight_ih_l2,
+        weight_hh_l2_packed,
+        bias_l2,
+        weight_ih_l3,
+        weight_hh_l3_packed,
+        bias_l3,
+        linear_weight,
+        linear_bias);
+  }
+
+  auto x_c = x.contiguous();
+  auto wih0 = weight_ih_l0.contiguous();
+  auto whh0 = weight_hh_l0_packed.contiguous();
+  auto b0 = bias_l0.contiguous();
+  auto wih1 = weight_ih_l1.contiguous();
+  auto whh1 = weight_hh_l1_packed.contiguous();
+  auto b1 = bias_l1.contiguous();
+  auto wih2 = weight_ih_l2.contiguous();
+  auto whh2 = weight_hh_l2_packed.contiguous();
+  auto b2 = bias_l2.contiguous();
+  auto wih3 = weight_ih_l3.contiguous();
+  auto whh3 = weight_hh_l3_packed.contiguous();
+  auto b3 = bias_l3.contiguous();
+  auto lw = linear_weight.contiguous();
+  auto lb = linear_bias.contiguous();
+
+  const int64_t seq_len = x_c.size(1);
+  const int virtual_blocks = static_cast<int>(std::min<int64_t>(virtual_batch_size, 1024));
+  auto seq0 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_l0_full_partitioned_kernel<kP8RecurrentPartitions, kP8PartitionedThreads>),
+      virtual_blocks,
+      kP8PartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(x_c.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(wih0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh0.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(b0.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq0.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate1 = (torch::matmul(seq0, wih1.transpose(0, 1)) + b1).contiguous();
+  auto seq1 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_full_partitioned_kernel<kP8RecurrentPartitions, kP8PartitionedThreads>),
+      virtual_blocks,
+      kP8PartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate1.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh1.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq1.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate2 = (torch::matmul(seq1, wih2.transpose(0, 1)) + b2).contiguous();
+  auto seq2 = torch::empty({seq_len, kHiddenSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_full_partitioned_kernel<kP8RecurrentPartitions, kP8PartitionedThreads>),
+      virtual_blocks,
+      kP8PartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate2.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh2.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(seq2.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  auto gate3 = (torch::matmul(seq2, wih3.transpose(0, 1)) + b3).contiguous();
+  auto out = torch::empty({1, kOutputSize}, x_c.options());
+  GPU_LAUNCH_KERNEL(
+      (persistent_lstm_projected_uniform_last_linear_partitioned_kernel<kP8RecurrentPartitions, kP8PartitionedThreads>),
+      virtual_blocks,
+      kP8PartitionedThreads,
+      0,
+      0,
+      reinterpret_cast<const gpu_half*>(gate3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(whh3.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lw.data_ptr<at::Half>()),
+      reinterpret_cast<const gpu_half*>(lb.data_ptr<at::Half>()),
+      reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
+      virtual_blocks,
+      static_cast<int>(seq_len));
+  check_last_error();
+
+  return out;
 }
 
 torch::Tensor persistent_lstm4_forward_monolithic_hip(

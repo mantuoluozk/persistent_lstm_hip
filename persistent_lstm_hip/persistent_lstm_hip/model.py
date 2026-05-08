@@ -254,6 +254,16 @@ class PersistentLSTMRegressor(nn.Module):
             raise ValueError("PERSISTENT_LSTM_HIP_UNIFORM_COMPUTE_BATCH must be an integer") from exc
         return max(1, min(output_batch_size, requested))
 
+    def _uniform_projected_virtual_batch_size(self, fallback_batch_size: int) -> int:
+        raw = os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_VIRTUAL_BATCH", "4").strip()
+        if raw == "":
+            return fallback_batch_size
+        try:
+            requested = int(raw)
+        except ValueError as exc:
+            raise ValueError("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_VIRTUAL_BATCH must be an integer") from exc
+        return max(1, requested)
+
     def _ensure_specialized_cache(self) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         cache_key = self._current_specialized_cache_key()
         if (
@@ -313,6 +323,19 @@ class PersistentLSTMRegressor(nn.Module):
                 hasattr(ext, "persistent_lstm4_forward_projected_uniform") and
                 os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED", "1") == "1"
             )
+            use_uniform_projected_p4 = (
+                use_uniform_projected and
+                hasattr(ext, "persistent_lstm4_forward_projected_uniform_p4") and
+                os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_P4", "1") == "1"
+            )
+            use_uniform_projected_p8 = (
+                use_uniform_projected_p4 and
+                hasattr(ext, "persistent_lstm4_forward_projected_uniform_p8") and
+                os.environ.get("PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_P8", "0") == "1"
+            )
+            uniform_projected_virtual_batch_size = self._uniform_projected_virtual_batch_size(
+                uniform_compute_batch_size
+            )
             if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
                 print(
                     "persistent_lstm_hip debug: "
@@ -320,14 +343,29 @@ class PersistentLSTMRegressor(nn.Module):
                     f"output_batch={output_batch_size}, "
                     f"compute_batch={int(x.size(0))}, "
                     f"uniform_batch_fast_path={use_uniform_fast_path}, "
-                    f"uniform_projected={use_uniform_projected}"
+                    f"uniform_projected={use_uniform_projected}, "
+                    f"uniform_projected_p4={use_uniform_projected_p4}, "
+                    f"uniform_projected_p8={use_uniform_projected_p8}, "
+                    f"uniform_projected_virtual_batch={uniform_projected_virtual_batch_size}"
                 )
                 self._debug_reported = True
             if backend == "projected":
-                if use_uniform_projected:
+                if use_uniform_projected_p8:
+                    out = ext.persistent_lstm4_forward_projected_uniform_p8(
+                        x.narrow(0, 0, 1),
+                        uniform_projected_virtual_batch_size,
+                        *projected_args,
+                    )
+                elif use_uniform_projected_p4:
+                    out = ext.persistent_lstm4_forward_projected_uniform_p4(
+                        x.narrow(0, 0, 1),
+                        uniform_projected_virtual_batch_size,
+                        *projected_args,
+                    )
+                elif use_uniform_projected:
                     out = ext.persistent_lstm4_forward_projected_uniform(
                         x.narrow(0, 0, 1),
-                        uniform_compute_batch_size,
+                        uniform_projected_virtual_batch_size,
                         *projected_args,
                     )
                 else:

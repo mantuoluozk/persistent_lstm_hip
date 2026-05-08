@@ -1,10 +1,14 @@
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 ROOT = Path(__file__).parent
+NVCC_ARGS = ["-O3", "-std=c++17"]
+if torch.version.hip is not None:
+    NVCC_ARGS.append("--gpu-max-threads-per-block=512")
 
 
 setup(
@@ -23,10 +27,9 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17"],
+                "nvcc": NVCC_ARGS,
             },
         )
     ],
     cmdclass={"build_ext": BuildExtension},
 )
-
