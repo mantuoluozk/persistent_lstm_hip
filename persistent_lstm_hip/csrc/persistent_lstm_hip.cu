@@ -832,6 +832,7 @@ __global__ void persistent_lstm_projected_last_kernel(
 __global__ void persistent_lstm_generic_projected_layer_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh,
+    const gpu_half* __restrict__ bias,
     gpu_half* __restrict__ out,
     int batch_size,
     int seq_len,
@@ -850,10 +851,14 @@ __global__ void persistent_lstm_generic_projected_layer_kernel(
   for (int t = 0; t < seq_len; ++t) {
     if (h < hidden_size) {
       const int gate_base = (b * seq_len + t) * (4 * hidden_size);
-      float i_acc = half_to_float(gate_proj[gate_base + 0 * hidden_size + h]);
-      float f_acc = half_to_float(gate_proj[gate_base + 1 * hidden_size + h]);
-      float g_acc = half_to_float(gate_proj[gate_base + 2 * hidden_size + h]);
-      float o_acc = half_to_float(gate_proj[gate_base + 3 * hidden_size + h]);
+      float i_acc = half_to_float(gate_proj[gate_base + 0 * hidden_size + h]) +
+                    half_to_float(bias[0 * hidden_size + h]);
+      float f_acc = half_to_float(gate_proj[gate_base + 1 * hidden_size + h]) +
+                    half_to_float(bias[1 * hidden_size + h]);
+      float g_acc = half_to_float(gate_proj[gate_base + 2 * hidden_size + h]) +
+                    half_to_float(bias[2 * hidden_size + h]);
+      float o_acc = half_to_float(gate_proj[gate_base + 3 * hidden_size + h]) +
+                    half_to_float(bias[3 * hidden_size + h]);
 
       for (int k = 0; k < hidden_size; ++k) {
         const float hv = half_to_float(h_cur[k]);
@@ -884,6 +889,7 @@ __global__ void persistent_lstm_generic_projected_layer_kernel(
 __global__ void persistent_lstm_generic_projected_layer_p4_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh,
+    const gpu_half* __restrict__ bias,
     gpu_half* __restrict__ out,
     int batch_size,
     int seq_len,
@@ -924,10 +930,14 @@ __global__ void persistent_lstm_generic_projected_layer_p4_kernel(
 
     if (h < hidden_size && partition == 0) {
       const int gate_base = (b * seq_len + t) * (4 * hidden_size);
-      const float i_acc = half_to_float(gate_proj[gate_base + 0 * hidden_size + h]) + i_recur;
-      const float f_acc = half_to_float(gate_proj[gate_base + 1 * hidden_size + h]) + f_recur;
-      const float g_acc = half_to_float(gate_proj[gate_base + 2 * hidden_size + h]) + g_recur;
-      const float o_acc = half_to_float(gate_proj[gate_base + 3 * hidden_size + h]) + o_recur;
+      const float i_acc = half_to_float(gate_proj[gate_base + 0 * hidden_size + h]) +
+                          half_to_float(bias[0 * hidden_size + h]) + i_recur;
+      const float f_acc = half_to_float(gate_proj[gate_base + 1 * hidden_size + h]) +
+                          half_to_float(bias[1 * hidden_size + h]) + f_recur;
+      const float g_acc = half_to_float(gate_proj[gate_base + 2 * hidden_size + h]) +
+                          half_to_float(bias[2 * hidden_size + h]) + g_recur;
+      const float o_acc = half_to_float(gate_proj[gate_base + 3 * hidden_size + h]) +
+                          half_to_float(bias[3 * hidden_size + h]) + o_recur;
       const float i_gate = sigmoidf_fast(i_acc);
       const float f_gate = sigmoidf_fast(f_acc);
       const float g_gate = tanhf(g_acc);
@@ -949,6 +959,7 @@ __global__ void persistent_lstm_generic_projected_layer_p4_kernel(
 __global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh,
+    const gpu_half* __restrict__ bias,
     gpu_half* __restrict__ out,
     int batch_size,
     int seq_len,
@@ -1005,10 +1016,14 @@ __global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_ke
 
     if (partition == 0) {
       const int gate_base = (b * seq_len + t) * (4 * kH);
-      const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) + i_recur;
-      const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) + f_recur;
-      const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) + g_recur;
-      const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) + o_recur;
+      const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) +
+                          half_to_float(bias[0 * kH + h]) + i_recur;
+      const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) +
+                          half_to_float(bias[1 * kH + h]) + f_recur;
+      const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) +
+                          half_to_float(bias[2 * kH + h]) + g_recur;
+      const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) +
+                          half_to_float(bias[3 * kH + h]) + o_recur;
       const float i_gate = sigmoidf_fast(i_acc);
       const float f_gate = sigmoidf_fast(f_acc);
       const float g_gate = tanhf(g_acc);
@@ -2704,7 +2719,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
     }
 
     auto input_2d = layer_input.view({batch_size * seq_len, input_size});
-    auto gate = (torch::matmul(input_2d, wih.transpose(0, 1)) + b)
+    auto gate = torch::matmul(input_2d, wih.transpose(0, 1))
                     .view({batch_size, seq_len, 4 * hidden_size})
                     .contiguous();
     const bool is_last = layer_idx == num_layers - 1;
@@ -2730,6 +2745,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
           0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
           reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
           static_cast<int>(batch_size),
           static_cast<int>(seq_len),
@@ -2743,6 +2759,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
           0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
           reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
           static_cast<int>(batch_size),
           static_cast<int>(seq_len),
@@ -2757,6 +2774,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
           0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
           reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
           static_cast<int>(batch_size),
           static_cast<int>(seq_len),
