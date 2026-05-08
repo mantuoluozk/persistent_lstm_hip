@@ -27,6 +27,7 @@ namespace {
 constexpr int kHiddenSize = 128;
 constexpr int kInputSize = 5;
 constexpr int kThreads = 128;
+constexpr int kWaveThreads = 64;
 constexpr int kGateCols = 4 * kHiddenSize;
 constexpr int kHiddenPairs = kHiddenSize / 2;
 
@@ -67,6 +68,48 @@ __device__ inline void accumulate_packed_pairs(
              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base + 1]);
     o_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base + 0]) +
              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base + 1]);
+  }
+}
+
+__device__ inline void accumulate_packed_pairs_dual(
+    const gpu_half* __restrict__ values,
+    int value_count,
+    const gpu_half* __restrict__ weights_packed,
+    int out_idx0,
+    int out_idx1,
+    float& i0_acc,
+    float& f0_acc,
+    float& g0_acc,
+    float& o0_acc,
+    float& i1_acc,
+    float& f1_acc,
+    float& g1_acc,
+    float& o1_acc) {
+  const int pair_count = (value_count + 1) / 2;
+  const int col_base0 = out_idx0 * 2;
+  const int col_base1 = out_idx1 * 2;
+  for (int pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
+    const int k0 = pair_idx * 2;
+    const int k1 = k0 + 1;
+    const float v0 = k0 < value_count ? half_to_float(values[k0]) : 0.0f;
+    const float v1 = k1 < value_count ? half_to_float(values[k1]) : 0.0f;
+    const int pair_base = pair_idx * (kGateCols * 2);
+    i0_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base0 + 1]);
+    f0_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base0 + 1]);
+    g0_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base0 + 1]);
+    o0_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base0 + 1]);
+    i1_acc += v0 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (0 * kHiddenSize * 2) + col_base1 + 1]);
+    f1_acc += v0 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (1 * kHiddenSize * 2) + col_base1 + 1]);
+    g1_acc += v0 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (2 * kHiddenSize * 2) + col_base1 + 1]);
+    o1_acc += v0 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 0]) +
+              v1 * half_to_float(weights_packed[pair_base + (3 * kHiddenSize * 2) + col_base1 + 1]);
   }
 }
 
@@ -317,59 +360,94 @@ __global__ void persistent_lstm_pair01_interleaved_kernel(
     int batch_size,
     int seq_len) {
   const int b = blockIdx.x;
-  const int h = threadIdx.x;
-  if (b >= batch_size || h >= kHiddenSize) {
+  const int lane = threadIdx.x;
+  if (b >= batch_size || lane >= kWaveThreads) {
     return;
   }
+  const int h0 = lane;
+  const int h1 = lane + kWaveThreads;
 
   __shared__ gpu_half x_step[kInputSize];
   __shared__ gpu_half h0_cur[kHiddenSize];
   __shared__ gpu_half h1_cur[kHiddenSize];
-  float c0_reg = 0.0f;
-  float c1_reg = 0.0f;
+  float c0_reg0 = 0.0f;
+  float c0_reg1 = 0.0f;
+  float c1_reg0 = 0.0f;
+  float c1_reg1 = 0.0f;
 
-  if (h < kInputSize) {
-    x_step[h] = float_to_half(0.0f);
+  if (lane < kInputSize) {
+    x_step[lane] = float_to_half(0.0f);
   }
-  h0_cur[h] = float_to_half(0.0f);
-  h1_cur[h] = float_to_half(0.0f);
+  h0_cur[h0] = float_to_half(0.0f);
+  h0_cur[h1] = float_to_half(0.0f);
+  h1_cur[h0] = float_to_half(0.0f);
+  h1_cur[h1] = float_to_half(0.0f);
   __syncthreads();
 
   for (int t = 0; t < seq_len; ++t) {
-    if (h < kInputSize) {
-      x_step[h] = x[(b * seq_len + t) * kInputSize + h];
+    if (lane < kInputSize) {
+      x_step[lane] = x[(b * seq_len + t) * kInputSize + lane];
     }
     __syncthreads();
 
-    float i0 = half_to_float(bias_l0[0 * kHiddenSize + h]);
-    float f0 = half_to_float(bias_l0[1 * kHiddenSize + h]);
-    float g0 = half_to_float(bias_l0[2 * kHiddenSize + h]);
-    float o0 = half_to_float(bias_l0[3 * kHiddenSize + h]);
-    accumulate_packed_pairs(x_step, kInputSize, weight_ih_l0_packed, h, i0, f0, g0, o0);
-    accumulate_packed_pairs(h0_cur, kHiddenSize, weight_hh_l0_packed, h, i0, f0, g0, o0);
+    float i0_0 = half_to_float(bias_l0[0 * kHiddenSize + h0]);
+    float f0_0 = half_to_float(bias_l0[1 * kHiddenSize + h0]);
+    float g0_0 = half_to_float(bias_l0[2 * kHiddenSize + h0]);
+    float o0_0 = half_to_float(bias_l0[3 * kHiddenSize + h0]);
+    float i0_1 = half_to_float(bias_l0[0 * kHiddenSize + h1]);
+    float f0_1 = half_to_float(bias_l0[1 * kHiddenSize + h1]);
+    float g0_1 = half_to_float(bias_l0[2 * kHiddenSize + h1]);
+    float o0_1 = half_to_float(bias_l0[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        x_step, kInputSize, weight_ih_l0_packed, h0, h1,
+        i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_hh_l0_packed, h0, h1,
+        i0_0, f0_0, g0_0, o0_0, i0_1, f0_1, g0_1, o0_1);
 
-    const float i0_gate = sigmoidf_fast(i0);
-    const float f0_gate = sigmoidf_fast(f0);
-    const float g0_gate = tanhf(g0);
-    const float o0_gate = sigmoidf_fast(o0);
-    c0_reg = f0_gate * c0_reg + i0_gate * g0_gate;
-    h0_cur[h] = float_to_half(o0_gate * tanhf(c0_reg));
+    const float i0_gate0 = sigmoidf_fast(i0_0);
+    const float f0_gate0 = sigmoidf_fast(f0_0);
+    const float g0_gate0 = tanhf(g0_0);
+    const float o0_gate0 = sigmoidf_fast(o0_0);
+    const float i0_gate1 = sigmoidf_fast(i0_1);
+    const float f0_gate1 = sigmoidf_fast(f0_1);
+    const float g0_gate1 = tanhf(g0_1);
+    const float o0_gate1 = sigmoidf_fast(o0_1);
+    c0_reg0 = f0_gate0 * c0_reg0 + i0_gate0 * g0_gate0;
+    c0_reg1 = f0_gate1 * c0_reg1 + i0_gate1 * g0_gate1;
+    h0_cur[h0] = float_to_half(o0_gate0 * tanhf(c0_reg0));
+    h0_cur[h1] = float_to_half(o0_gate1 * tanhf(c0_reg1));
     __syncthreads();
 
-    float i1 = half_to_float(bias_l1[0 * kHiddenSize + h]);
-    float f1 = half_to_float(bias_l1[1 * kHiddenSize + h]);
-    float g1 = half_to_float(bias_l1[2 * kHiddenSize + h]);
-    float o1 = half_to_float(bias_l1[3 * kHiddenSize + h]);
-    accumulate_packed_pairs(h0_cur, kHiddenSize, weight_ih_l1_packed, h, i1, f1, g1, o1);
-    accumulate_packed_pairs(h1_cur, kHiddenSize, weight_hh_l1_packed, h, i1, f1, g1, o1);
+    float i1_0 = half_to_float(bias_l1[0 * kHiddenSize + h0]);
+    float f1_0 = half_to_float(bias_l1[1 * kHiddenSize + h0]);
+    float g1_0 = half_to_float(bias_l1[2 * kHiddenSize + h0]);
+    float o1_0 = half_to_float(bias_l1[3 * kHiddenSize + h0]);
+    float i1_1 = half_to_float(bias_l1[0 * kHiddenSize + h1]);
+    float f1_1 = half_to_float(bias_l1[1 * kHiddenSize + h1]);
+    float g1_1 = half_to_float(bias_l1[2 * kHiddenSize + h1]);
+    float o1_1 = half_to_float(bias_l1[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        h0_cur, kHiddenSize, weight_ih_l1_packed, h0, h1,
+        i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
+    accumulate_packed_pairs_dual(
+        h1_cur, kHiddenSize, weight_hh_l1_packed, h0, h1,
+        i1_0, f1_0, g1_0, o1_0, i1_1, f1_1, g1_1, o1_1);
 
-    const float i1_gate = sigmoidf_fast(i1);
-    const float f1_gate = sigmoidf_fast(f1);
-    const float g1_gate = tanhf(g1);
-    const float o1_gate = sigmoidf_fast(o1);
-    c1_reg = f1_gate * c1_reg + i1_gate * g1_gate;
-    h1_cur[h] = float_to_half(o1_gate * tanhf(c1_reg));
-    out[(b * seq_len + t) * kHiddenSize + h] = h1_cur[h];
+    const float i1_gate0 = sigmoidf_fast(i1_0);
+    const float f1_gate0 = sigmoidf_fast(f1_0);
+    const float g1_gate0 = tanhf(g1_0);
+    const float o1_gate0 = sigmoidf_fast(o1_0);
+    const float i1_gate1 = sigmoidf_fast(i1_1);
+    const float f1_gate1 = sigmoidf_fast(f1_1);
+    const float g1_gate1 = tanhf(g1_1);
+    const float o1_gate1 = sigmoidf_fast(o1_1);
+    c1_reg0 = f1_gate0 * c1_reg0 + i1_gate0 * g1_gate0;
+    c1_reg1 = f1_gate1 * c1_reg1 + i1_gate1 * g1_gate1;
+    h1_cur[h0] = float_to_half(o1_gate0 * tanhf(c1_reg0));
+    h1_cur[h1] = float_to_half(o1_gate1 * tanhf(c1_reg1));
+    out[(b * seq_len + t) * kHiddenSize + h0] = h1_cur[h0];
+    out[(b * seq_len + t) * kHiddenSize + h1] = h1_cur[h1];
     __syncthreads();
   }
 }
@@ -386,58 +464,95 @@ __global__ void persistent_lstm_pair23_last_interleaved_kernel(
     int batch_size,
     int seq_len) {
   const int b = blockIdx.x;
-  const int h = threadIdx.x;
-  if (b >= batch_size || h >= kHiddenSize) {
+  const int lane = threadIdx.x;
+  if (b >= batch_size || lane >= kWaveThreads) {
     return;
   }
+  const int h0 = lane;
+  const int h1 = lane + kWaveThreads;
 
   __shared__ gpu_half x_step[kHiddenSize];
   __shared__ gpu_half h2_cur[kHiddenSize];
   __shared__ gpu_half h3_cur[kHiddenSize];
-  float c2_reg = 0.0f;
-  float c3_reg = 0.0f;
+  float c2_reg0 = 0.0f;
+  float c2_reg1 = 0.0f;
+  float c3_reg0 = 0.0f;
+  float c3_reg1 = 0.0f;
 
-  x_step[h] = float_to_half(0.0f);
-  h2_cur[h] = float_to_half(0.0f);
-  h3_cur[h] = float_to_half(0.0f);
+  x_step[h0] = float_to_half(0.0f);
+  x_step[h1] = float_to_half(0.0f);
+  h2_cur[h0] = float_to_half(0.0f);
+  h2_cur[h1] = float_to_half(0.0f);
+  h3_cur[h0] = float_to_half(0.0f);
+  h3_cur[h1] = float_to_half(0.0f);
   __syncthreads();
 
   for (int t = 0; t < seq_len; ++t) {
-    x_step[h] = x[(b * seq_len + t) * kHiddenSize + h];
+    x_step[h0] = x[(b * seq_len + t) * kHiddenSize + h0];
+    x_step[h1] = x[(b * seq_len + t) * kHiddenSize + h1];
     __syncthreads();
 
-    float i2 = half_to_float(bias_l2[0 * kHiddenSize + h]);
-    float f2 = half_to_float(bias_l2[1 * kHiddenSize + h]);
-    float g2 = half_to_float(bias_l2[2 * kHiddenSize + h]);
-    float o2 = half_to_float(bias_l2[3 * kHiddenSize + h]);
-    accumulate_packed_pairs(x_step, kHiddenSize, weight_ih_l2_packed, h, i2, f2, g2, o2);
-    accumulate_packed_pairs(h2_cur, kHiddenSize, weight_hh_l2_packed, h, i2, f2, g2, o2);
+    float i2_0 = half_to_float(bias_l2[0 * kHiddenSize + h0]);
+    float f2_0 = half_to_float(bias_l2[1 * kHiddenSize + h0]);
+    float g2_0 = half_to_float(bias_l2[2 * kHiddenSize + h0]);
+    float o2_0 = half_to_float(bias_l2[3 * kHiddenSize + h0]);
+    float i2_1 = half_to_float(bias_l2[0 * kHiddenSize + h1]);
+    float f2_1 = half_to_float(bias_l2[1 * kHiddenSize + h1]);
+    float g2_1 = half_to_float(bias_l2[2 * kHiddenSize + h1]);
+    float o2_1 = half_to_float(bias_l2[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        x_step, kHiddenSize, weight_ih_l2_packed, h0, h1,
+        i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_hh_l2_packed, h0, h1,
+        i2_0, f2_0, g2_0, o2_0, i2_1, f2_1, g2_1, o2_1);
 
-    const float i2_gate = sigmoidf_fast(i2);
-    const float f2_gate = sigmoidf_fast(f2);
-    const float g2_gate = tanhf(g2);
-    const float o2_gate = sigmoidf_fast(o2);
-    c2_reg = f2_gate * c2_reg + i2_gate * g2_gate;
-    h2_cur[h] = float_to_half(o2_gate * tanhf(c2_reg));
+    const float i2_gate0 = sigmoidf_fast(i2_0);
+    const float f2_gate0 = sigmoidf_fast(f2_0);
+    const float g2_gate0 = tanhf(g2_0);
+    const float o2_gate0 = sigmoidf_fast(o2_0);
+    const float i2_gate1 = sigmoidf_fast(i2_1);
+    const float f2_gate1 = sigmoidf_fast(f2_1);
+    const float g2_gate1 = tanhf(g2_1);
+    const float o2_gate1 = sigmoidf_fast(o2_1);
+    c2_reg0 = f2_gate0 * c2_reg0 + i2_gate0 * g2_gate0;
+    c2_reg1 = f2_gate1 * c2_reg1 + i2_gate1 * g2_gate1;
+    h2_cur[h0] = float_to_half(o2_gate0 * tanhf(c2_reg0));
+    h2_cur[h1] = float_to_half(o2_gate1 * tanhf(c2_reg1));
     __syncthreads();
 
-    float i3 = half_to_float(bias_l3[0 * kHiddenSize + h]);
-    float f3 = half_to_float(bias_l3[1 * kHiddenSize + h]);
-    float g3 = half_to_float(bias_l3[2 * kHiddenSize + h]);
-    float o3 = half_to_float(bias_l3[3 * kHiddenSize + h]);
-    accumulate_packed_pairs(h2_cur, kHiddenSize, weight_ih_l3_packed, h, i3, f3, g3, o3);
-    accumulate_packed_pairs(h3_cur, kHiddenSize, weight_hh_l3_packed, h, i3, f3, g3, o3);
+    float i3_0 = half_to_float(bias_l3[0 * kHiddenSize + h0]);
+    float f3_0 = half_to_float(bias_l3[1 * kHiddenSize + h0]);
+    float g3_0 = half_to_float(bias_l3[2 * kHiddenSize + h0]);
+    float o3_0 = half_to_float(bias_l3[3 * kHiddenSize + h0]);
+    float i3_1 = half_to_float(bias_l3[0 * kHiddenSize + h1]);
+    float f3_1 = half_to_float(bias_l3[1 * kHiddenSize + h1]);
+    float g3_1 = half_to_float(bias_l3[2 * kHiddenSize + h1]);
+    float o3_1 = half_to_float(bias_l3[3 * kHiddenSize + h1]);
+    accumulate_packed_pairs_dual(
+        h2_cur, kHiddenSize, weight_ih_l3_packed, h0, h1,
+        i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
+    accumulate_packed_pairs_dual(
+        h3_cur, kHiddenSize, weight_hh_l3_packed, h0, h1,
+        i3_0, f3_0, g3_0, o3_0, i3_1, f3_1, g3_1, o3_1);
 
-    const float i3_gate = sigmoidf_fast(i3);
-    const float f3_gate = sigmoidf_fast(f3);
-    const float g3_gate = tanhf(g3);
-    const float o3_gate = sigmoidf_fast(o3);
-    c3_reg = f3_gate * c3_reg + i3_gate * g3_gate;
-    h3_cur[h] = float_to_half(o3_gate * tanhf(c3_reg));
+    const float i3_gate0 = sigmoidf_fast(i3_0);
+    const float f3_gate0 = sigmoidf_fast(f3_0);
+    const float g3_gate0 = tanhf(g3_0);
+    const float o3_gate0 = sigmoidf_fast(o3_0);
+    const float i3_gate1 = sigmoidf_fast(i3_1);
+    const float f3_gate1 = sigmoidf_fast(f3_1);
+    const float g3_gate1 = tanhf(g3_1);
+    const float o3_gate1 = sigmoidf_fast(o3_1);
+    c3_reg0 = f3_gate0 * c3_reg0 + i3_gate0 * g3_gate0;
+    c3_reg1 = f3_gate1 * c3_reg1 + i3_gate1 * g3_gate1;
+    h3_cur[h0] = float_to_half(o3_gate0 * tanhf(c3_reg0));
+    h3_cur[h1] = float_to_half(o3_gate1 * tanhf(c3_reg1));
     __syncthreads();
   }
 
-  out[b * kHiddenSize + h] = h3_cur[h];
+  out[b * kHiddenSize + h0] = h3_cur[h0];
+  out[b * kHiddenSize + h1] = h3_cur[h1];
 }
 
 __global__ void persistent_lstm_projected_full_kernel(
@@ -964,7 +1079,7 @@ torch::Tensor persistent_lstm4_forward_interleaved_hip(
   GPU_LAUNCH_KERNEL(
       persistent_lstm_pair01_interleaved_kernel,
       batch_size,
-      kThreads,
+      kWaveThreads,
       0,
       0,
       x_ptr,
@@ -982,7 +1097,7 @@ torch::Tensor persistent_lstm4_forward_interleaved_hip(
   GPU_LAUNCH_KERNEL(
       persistent_lstm_pair23_last_interleaved_kernel,
       batch_size,
-      kThreads,
+      kWaveThreads,
       0,
       0,
       seq01_ptr,
