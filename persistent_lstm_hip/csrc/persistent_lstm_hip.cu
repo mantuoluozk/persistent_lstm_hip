@@ -977,6 +977,10 @@ __global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_ke
   gpu_half f_w[kPerPartition];
   gpu_half g_w[kPerPartition];
   gpu_half o_w[kPerPartition];
+  const gpu_half i_bias = bias[0 * kH + h];
+  const gpu_half f_bias = bias[1 * kH + h];
+  const gpu_half g_bias = bias[2 * kH + h];
+  const gpu_half o_bias = bias[3 * kH + h];
 
   #pragma unroll
   for (int idx = 0; idx < kPerPartition; ++idx) {
@@ -1017,13 +1021,13 @@ __global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_ke
     if (partition == 0) {
       const int gate_base = (b * seq_len + t) * (4 * kH);
       const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) +
-                          half_to_float(bias[0 * kH + h]) + i_recur;
+                          half_to_float(i_bias) + i_recur;
       const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) +
-                          half_to_float(bias[1 * kH + h]) + f_recur;
+                          half_to_float(f_bias) + f_recur;
       const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) +
-                          half_to_float(bias[2 * kH + h]) + g_recur;
+                          half_to_float(g_bias) + g_recur;
       const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) +
-                          half_to_float(bias[3 * kH + h]) + o_recur;
+                          half_to_float(o_bias) + o_recur;
       const float i_gate = sigmoidf_fast(i_acc);
       const float f_gate = sigmoidf_fast(f_acc);
       const float g_gate = tanhf(g_acc);
