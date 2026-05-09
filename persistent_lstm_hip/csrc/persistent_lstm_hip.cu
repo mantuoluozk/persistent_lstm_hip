@@ -1,6 +1,10 @@
 #include "persistent_lstm_hip.h"
 
+#include <c10/core/InferenceMode.h>
+
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -37,6 +41,57 @@ constexpr int kWaveThreads = 64;
 constexpr int kGateCols = 4 * kHiddenSize;
 constexpr int kHiddenPairs = kHiddenSize / 2;
 constexpr int kOutputSize = 24;
+
+enum class H128Mode {
+  kGenericP4,
+  kCachedP4B2FStateStatic,
+  kRecurGemm,
+};
+
+H128Mode h128_mode_from_env() {
+  const char* raw = std::getenv("PERSISTENT_LSTM_HIP_H128_MODE");
+  if (raw == nullptr || raw[0] == '\0' ||
+      std::strcmp(raw, "generic") == 0 ||
+      std::strcmp(raw, "generic_p4") == 0 ||
+      std::strcmp(raw, "p4") == 0) {
+    return H128Mode::kGenericP4;
+  }
+  if (std::strcmp(raw, "best") == 0 ||
+      std::strcmp(raw, "auto") == 0 ||
+      std::strcmp(raw, "recur_gemm") == 0 ||
+      std::strcmp(raw, "gemm_scan") == 0 ||
+      std::strcmp(raw, "h128_recur_gemm") == 0) {
+    return H128Mode::kRecurGemm;
+  }
+  if (std::strcmp(raw, "persistent_scalar") == 0 ||
+      std::strcmp(raw, "scalar") == 0 ||
+      std::strcmp(raw, "cached_p4_b2_fstate_static") == 0 ||
+      std::strcmp(raw, "cached_b2_fstate_static") == 0 ||
+      std::strcmp(raw, "h128_b2_fstate_static") == 0 ||
+      std::strcmp(raw, "fstate_static") == 0) {
+    return H128Mode::kCachedP4B2FStateStatic;
+  }
+  if (std::strcmp(raw, "native") == 0 ||
+      std::strcmp(raw, "fallback") == 0 ||
+      std::strcmp(raw, "pytorch") == 0 ||
+      std::strcmp(raw, "off") == 0 ||
+      std::strcmp(raw, "disable") == 0 ||
+      std::strcmp(raw, "disabled") == 0) {
+    throw std::invalid_argument("native H128 fallback is handled by the Python dispatcher");
+  }
+  throw std::invalid_argument(
+      "PERSISTENT_LSTM_HIP_H128_MODE must be one of: native, best, recur_gemm, persistent_scalar");
+}
+
+bool h128_env_requests_recur_gemm() {
+  const char* raw = std::getenv("PERSISTENT_LSTM_HIP_H128_MODE");
+  return raw != nullptr &&
+      (std::strcmp(raw, "best") == 0 ||
+       std::strcmp(raw, "auto") == 0 ||
+       std::strcmp(raw, "recur_gemm") == 0 ||
+       std::strcmp(raw, "gemm_scan") == 0 ||
+       std::strcmp(raw, "h128_recur_gemm") == 0);
+}
 
 __device__ inline float sigmoidf_fast(float x) {
   return 1.0f / (1.0f + expf(-x));
@@ -1043,6 +1098,199 @@ __global__ void __launch_bounds__(256) persistent_lstm_h64_projected_layer_p4_ke
 
   if (!write_sequence && partition == 0) {
     out[b * kH + h] = h_cur[h];
+  }
+}
+
+template <bool CheckTail, int WriteMode, int MinBlocksPerCU, bool FloatBias = false>
+__global__ void __launch_bounds__(512, MinBlocksPerCU) persistent_lstm_h128_projected_layer_b2_fstate_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh,
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int seq_len,
+    bool write_sequence) {
+  constexpr int kH = 128;
+  constexpr int kPartitions = 4;
+  constexpr int kPerPartition = kH / kPartitions;
+  constexpr int kBatchTile = 2;
+  const int b0 = blockIdx.x * kBatchTile;
+  const int b1 = b0 + 1;
+  const bool has_b1 = !CheckTail || b1 < batch_size;
+  const int tid = threadIdx.x;
+  const int h = tid / kPartitions;
+  const int partition = tid & (kPartitions - 1);
+  const bool do_write_sequence = WriteMode < 0 ? write_sequence : (WriteMode != 0);
+  __shared__ float h_cur[kBatchTile * kH];
+
+  gpu_half i_w[kPerPartition];
+  gpu_half f_w[kPerPartition];
+  gpu_half g_w[kPerPartition];
+  gpu_half o_w[kPerPartition];
+  const gpu_half i_bias = bias[0 * kH + h];
+  const gpu_half f_bias = bias[1 * kH + h];
+  const gpu_half g_bias = bias[2 * kH + h];
+  const gpu_half o_bias = bias[3 * kH + h];
+  const float i_bias_f = half_to_float(i_bias);
+  const float f_bias_f = half_to_float(f_bias);
+  const float g_bias_f = half_to_float(g_bias);
+  const float o_bias_f = half_to_float(o_bias);
+
+  #pragma unroll
+  for (int idx = 0; idx < kPerPartition; ++idx) {
+    const int k = partition + idx * kPartitions;
+    i_w[idx] = weight_hh[(0 * kH + h) * kH + k];
+    f_w[idx] = weight_hh[(1 * kH + h) * kH + k];
+    g_w[idx] = weight_hh[(2 * kH + h) * kH + k];
+    o_w[idx] = weight_hh[(3 * kH + h) * kH + k];
+  }
+
+  float c0_reg = 0.0f;
+  float c1_reg = 0.0f;
+  if (partition == 0) {
+    h_cur[h] = 0.0f;
+    h_cur[kH + h] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    float i0_recur = 0.0f;
+    float f0_recur = 0.0f;
+    float g0_recur = 0.0f;
+    float o0_recur = 0.0f;
+    float i1_recur = 0.0f;
+    float f1_recur = 0.0f;
+    float g1_recur = 0.0f;
+    float o1_recur = 0.0f;
+
+    #pragma unroll
+    for (int idx = 0; idx < kPerPartition; ++idx) {
+      const int k = partition + idx * kPartitions;
+      const float h0v = h_cur[k];
+      const float iw = half_to_float(i_w[idx]);
+      const float fw = half_to_float(f_w[idx]);
+      const float gw = half_to_float(g_w[idx]);
+      const float ow = half_to_float(o_w[idx]);
+      i0_recur += h0v * iw;
+      f0_recur += h0v * fw;
+      g0_recur += h0v * gw;
+      o0_recur += h0v * ow;
+      if (has_b1) {
+        const float h1v = h_cur[kH + k];
+        i1_recur += h1v * iw;
+        f1_recur += h1v * fw;
+        g1_recur += h1v * gw;
+        o1_recur += h1v * ow;
+      }
+    }
+
+    i0_recur = reduce_partition_sum<kPartitions>(i0_recur);
+    f0_recur = reduce_partition_sum<kPartitions>(f0_recur);
+    g0_recur = reduce_partition_sum<kPartitions>(g0_recur);
+    o0_recur = reduce_partition_sum<kPartitions>(o0_recur);
+    i1_recur = reduce_partition_sum<kPartitions>(i1_recur);
+    f1_recur = reduce_partition_sum<kPartitions>(f1_recur);
+    g1_recur = reduce_partition_sum<kPartitions>(g1_recur);
+    o1_recur = reduce_partition_sum<kPartitions>(o1_recur);
+
+    if (partition == 0) {
+      const int gate0_base = (b0 * seq_len + t) * (4 * kH);
+      const float i0_acc = half_to_float(gate_proj[gate0_base + 0 * kH + h]) +
+                           (FloatBias ? i_bias_f : half_to_float(i_bias)) + i0_recur;
+      const float f0_acc = half_to_float(gate_proj[gate0_base + 1 * kH + h]) +
+                           (FloatBias ? f_bias_f : half_to_float(f_bias)) + f0_recur;
+      const float g0_acc = half_to_float(gate_proj[gate0_base + 2 * kH + h]) +
+                           (FloatBias ? g_bias_f : half_to_float(g_bias)) + g0_recur;
+      const float o0_acc = half_to_float(gate_proj[gate0_base + 3 * kH + h]) +
+                           (FloatBias ? o_bias_f : half_to_float(o_bias)) + o0_recur;
+      const float i0_gate = sigmoidf_fast(i0_acc);
+      const float f0_gate = sigmoidf_fast(f0_acc);
+      const float g0_gate = tanhf(g0_acc);
+      const float o0_gate = sigmoidf_fast(o0_acc);
+      c0_reg = f0_gate * c0_reg + i0_gate * g0_gate;
+      h_cur[h] = o0_gate * tanhf(c0_reg);
+      if (do_write_sequence) {
+        out[(b0 * seq_len + t) * kH + h] = float_to_half(h_cur[h]);
+      }
+
+      if (has_b1) {
+        const int gate1_base = (b1 * seq_len + t) * (4 * kH);
+        const float i1_acc = half_to_float(gate_proj[gate1_base + 0 * kH + h]) +
+                             (FloatBias ? i_bias_f : half_to_float(i_bias)) + i1_recur;
+        const float f1_acc = half_to_float(gate_proj[gate1_base + 1 * kH + h]) +
+                             (FloatBias ? f_bias_f : half_to_float(f_bias)) + f1_recur;
+        const float g1_acc = half_to_float(gate_proj[gate1_base + 2 * kH + h]) +
+                             (FloatBias ? g_bias_f : half_to_float(g_bias)) + g1_recur;
+        const float o1_acc = half_to_float(gate_proj[gate1_base + 3 * kH + h]) +
+                             (FloatBias ? o_bias_f : half_to_float(o_bias)) + o1_recur;
+        const float i1_gate = sigmoidf_fast(i1_acc);
+        const float f1_gate = sigmoidf_fast(f1_acc);
+        const float g1_gate = tanhf(g1_acc);
+        const float o1_gate = sigmoidf_fast(o1_acc);
+        c1_reg = f1_gate * c1_reg + i1_gate * g1_gate;
+        h_cur[kH + h] = o1_gate * tanhf(c1_reg);
+        if (do_write_sequence) {
+          out[(b1 * seq_len + t) * kH + h] = float_to_half(h_cur[kH + h]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!do_write_sequence && partition == 0) {
+    out[b0 * kH + h] = float_to_half(h_cur[h]);
+    if (has_b1) {
+      out[b1 * kH + h] = float_to_half(h_cur[kH + h]);
+    }
+  }
+}
+
+template <bool WriteSequence>
+__global__ void __launch_bounds__(256) persistent_lstm_h128_recur_gemm_pointwise_kernel(
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ recur,
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ h_state,
+    float* __restrict__ c_state,
+    gpu_half* __restrict__ out,
+    int batch_size,
+    int seq_len,
+    int t) {
+  constexpr int kH = 128;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch_size * kH;
+  if (idx >= total) {
+    return;
+  }
+
+  const int b = idx / kH;
+  const int h = idx - b * kH;
+  const int gate_base = (b * seq_len + t) * (4 * kH);
+  const int recur_base = b * (4 * kH);
+
+  const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) +
+                      half_to_float(recur[recur_base + 0 * kH + h]) +
+                      half_to_float(bias[0 * kH + h]);
+  const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) +
+                      half_to_float(recur[recur_base + 1 * kH + h]) +
+                      half_to_float(bias[1 * kH + h]);
+  const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) +
+                      half_to_float(recur[recur_base + 2 * kH + h]) +
+                      half_to_float(bias[2 * kH + h]);
+  const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) +
+                      half_to_float(recur[recur_base + 3 * kH + h]) +
+                      half_to_float(bias[3 * kH + h]);
+
+  const float i_gate = sigmoidf_fast(i_acc);
+  const float f_gate = sigmoidf_fast(f_acc);
+  const float g_gate = tanhf(g_acc);
+  const float o_gate = sigmoidf_fast(o_acc);
+  const float c_new = f_gate * c_state[idx] + i_gate * g_gate;
+  const gpu_half h_new = float_to_half(o_gate * tanhf(c_new));
+  c_state[idx] = c_new;
+  h_state[idx] = h_new;
+  if (WriteSequence) {
+    out[(b * seq_len + t) * kH + h] = h_new;
   }
 }
 
@@ -2679,6 +2927,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
     const std::vector<torch::Tensor>& bias,
     const torch::Tensor& linear_weight,
     const torch::Tensor& linear_bias) {
+  c10::InferenceMode inference_mode;
   if (!(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.dim() == 3)) {
     throw std::invalid_argument("generic projected LSTM expects FP16 CUDA x with shape [B, T, I]");
   }
@@ -2697,20 +2946,34 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
     auto wih = weight_ih[layer_idx].contiguous();
     auto whh = weight_hh[layer_idx].contiguous();
     auto b = bias[layer_idx].contiguous();
+    const bool layer_uses_recur_gemm_wih_t =
+        h128_env_requests_recur_gemm() &&
+        wih.dim() == 2 &&
+        wih.size(0) == input_size &&
+        wih.size(1) % 4 == 0;
     if (!(wih.is_cuda() && whh.is_cuda() && b.is_cuda() &&
           wih.scalar_type() == torch::kFloat16 &&
           whh.scalar_type() == torch::kFloat16 &&
           b.scalar_type() == torch::kFloat16 &&
-          wih.dim() == 2 && whh.dim() == 2 && b.dim() == 1 &&
-          wih.size(1) == input_size &&
-          whh.size(0) == wih.size(0) &&
-          wih.size(0) % 4 == 0 &&
-          b.size(0) == wih.size(0))) {
+          wih.dim() == 2 && b.dim() == 1)) {
       throw std::invalid_argument("generic projected LSTM received incompatible layer weights");
     }
 
-    const int64_t layer_hidden_size = wih.size(0) / 4;
-    if (!(whh.size(0) == 4 * layer_hidden_size && whh.size(1) == layer_hidden_size)) {
+    const bool wih_shape_ok = layer_uses_recur_gemm_wih_t
+        ? (b.size(0) == wih.size(1))
+        : (wih.size(1) == input_size && wih.size(0) % 4 == 0 && b.size(0) == wih.size(0));
+    if (!wih_shape_ok) {
+      throw std::invalid_argument("generic projected LSTM received incompatible input weights");
+    }
+
+    const int64_t layer_hidden_size = layer_uses_recur_gemm_wih_t ? wih.size(1) / 4 : wih.size(0) / 4;
+    const H128Mode layer_h128_mode = layer_hidden_size == 128 ? h128_mode_from_env() : H128Mode::kGenericP4;
+    const bool layer_uses_recur_gemm_hh_t = layer_hidden_size == 128 && layer_h128_mode == H128Mode::kRecurGemm;
+    if (layer_uses_recur_gemm_hh_t) {
+      if (!(whh.dim() == 2 && whh.size(0) == layer_hidden_size && whh.size(1) == 4 * layer_hidden_size)) {
+        throw std::invalid_argument("generic projected recur_gemm recurrent weight must be pretransposed [H, 4H]");
+      }
+    } else if (!(whh.dim() == 2 && whh.size(0) == 4 * layer_hidden_size && whh.size(1) == layer_hidden_size)) {
       throw std::invalid_argument("generic projected LSTM recurrent weight must be [4H, H]");
     }
     if (hidden_size < 0) {
@@ -2723,7 +2986,10 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
     }
 
     auto input_2d = layer_input.view({batch_size * seq_len, input_size});
-    auto gate = torch::matmul(input_2d, wih.transpose(0, 1))
+    auto gate_2d = layer_uses_recur_gemm_wih_t
+        ? torch::matmul(input_2d, wih)
+        : torch::matmul(input_2d, wih.transpose(0, 1));
+    auto gate = gate_2d
                     .view({batch_size, seq_len, 4 * hidden_size})
                     .contiguous();
     const bool is_last = layer_idx == num_layers - 1;
@@ -2731,9 +2997,61 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
         ? torch::empty({batch_size, hidden_size}, x.options())
         : torch::empty({batch_size, seq_len, hidden_size}, x.options());
     const bool use_h64 = hidden_size == 64;
+    const H128Mode h128_mode = hidden_size == 128 ? h128_mode_from_env() : H128Mode::kGenericP4;
+    const bool use_h128_recur_gemm = hidden_size == 128 && h128_mode == H128Mode::kRecurGemm;
+    const bool use_h128_persistent_scalar = hidden_size == 128 && h128_mode == H128Mode::kCachedP4B2FStateStatic;
     const bool use_p4 = hidden_size <= 256;
+
+    if (use_h128_recur_gemm) {
+      auto whh_t = whh;
+      auto h_state = torch::zeros({batch_size, hidden_size}, x.options());
+      auto c_state = torch::zeros({batch_size, hidden_size}, x.options().dtype(torch::kFloat32));
+      auto recur = torch::empty({batch_size, 4 * hidden_size}, x.options());
+      const int pointwise_blocks = static_cast<int>((batch_size * hidden_size + 255) / 256);
+      for (int64_t t = 0; t < seq_len; ++t) {
+        at::mm_out(recur, h_state, whh_t);
+        if (is_last) {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_recur_gemm_pointwise_kernel<false>),
+              pointwise_blocks,
+              256,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(recur.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(h_state.data_ptr<at::Half>()),
+              static_cast<float*>(c_state.data_ptr<float>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              static_cast<int>(t));
+        } else {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_recur_gemm_pointwise_kernel<true>),
+              pointwise_blocks,
+              256,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(recur.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(h_state.data_ptr<at::Half>()),
+              static_cast<float*>(c_state.data_ptr<float>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              static_cast<int>(t));
+        }
+      }
+      if (is_last) {
+        layer_out = h_state;
+      }
+    } else {
     int threads = 1;
-    const int64_t logical_threads = (use_h64 || use_p4) ? hidden_size * 4 : hidden_size;
+    const int64_t logical_threads = (use_h64 || use_h128_persistent_scalar || use_p4)
+        ? hidden_size * 4
+        : hidden_size;
     while (threads < logical_threads) {
       threads <<= 1;
     }
@@ -2754,6 +3072,69 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
           static_cast<int>(batch_size),
           static_cast<int>(seq_len),
           !is_last);
+    } else if (use_h128_persistent_scalar) {
+      const bool write_sequence = !is_last;
+      if ((batch_size & 1) == 0) {
+        if (write_sequence) {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_projected_layer_b2_fstate_kernel<false, 1, 1>),
+              static_cast<int>(batch_size / 2),
+              512,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              true);
+        } else {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_projected_layer_b2_fstate_kernel<false, 0, 1>),
+              static_cast<int>(batch_size / 2),
+              512,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              false);
+        }
+      } else {
+        if (write_sequence) {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_projected_layer_b2_fstate_kernel<true, 1, 1>),
+              static_cast<int>((batch_size + 1) / 2),
+              512,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              true);
+        } else {
+          GPU_LAUNCH_KERNEL(
+              (persistent_lstm_h128_projected_layer_b2_fstate_kernel<true, 0, 1>),
+              static_cast<int>((batch_size + 1) / 2),
+              512,
+              0,
+              0,
+              reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+              reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+              reinterpret_cast<gpu_half*>(layer_out.data_ptr<at::Half>()),
+              static_cast<int>(batch_size),
+              static_cast<int>(seq_len),
+              false);
+        }
+      }
     } else if (use_p4) {
       GPU_LAUNCH_KERNEL(
           persistent_lstm_generic_projected_layer_p4_kernel,
@@ -2784,6 +3165,7 @@ torch::Tensor persistent_lstm_regressor_forward_generic_projected_hip(
           static_cast<int>(seq_len),
           static_cast<int>(hidden_size),
           !is_last);
+    }
     }
     check_last_error();
 

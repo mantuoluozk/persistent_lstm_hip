@@ -76,6 +76,51 @@ class NativeModuleFallback(nn.Module):
             return "hip_generic_projected_lstm"
         return self._backend_name
 
+    def _h128_mode(self) -> str:
+        return os.environ.get("PERSISTENT_LSTM_HIP_H128_MODE", "native").strip().lower()
+
+    def _is_h128_recur_gemm_mode(self) -> bool:
+        return self._h128_mode() in {"best", "auto", "recur_gemm", "gemm_scan", "h128_recur_gemm"}
+
+    def _is_h128_persistent_scalar_mode(self) -> bool:
+        return self._h128_mode() in {
+            "persistent_scalar",
+            "scalar",
+            "cached_p4_b2_fstate_static",
+            "cached_b2_fstate_static",
+            "h128_b2_fstate_static",
+            "fstate_static",
+        }
+
+    def _generic_projected_hidden_bucket_name(self) -> str:
+        hidden_size = int(self.module.lstm.hidden_size)
+        if hidden_size == 64:
+            return "h64"
+        if hidden_size == 128:
+            if self._is_h128_recur_gemm_mode():
+                return "h128_recur_gemm"
+            if self._is_h128_persistent_scalar_mode():
+                return "h128_persistent_scalar"
+            return "h128_native"
+        return "generic"
+
+    def _generic_projected_partition_name(self) -> str:
+        hidden_size = int(self.module.lstm.hidden_size)
+        if hidden_size == 128:
+            if self._is_h128_recur_gemm_mode():
+                return "gemm_scan"
+            if self._is_h128_persistent_scalar_mode():
+                return "p4"
+        if hidden_size <= 256:
+            return "p4"
+        return "single"
+
+    def _generic_uniform_batch_mode(self) -> str:
+        raw = os.environ.get("PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH")
+        if raw is not None:
+            return raw.strip().lower()
+        return "0"
+
     def __getattr__(self, name: str) -> Any:
         try:
             return super().__getattr__(name)
@@ -94,6 +139,19 @@ class NativeModuleFallback(nn.Module):
         linear = module.linear
         if not isinstance(lstm, nn.LSTM) or not isinstance(linear, nn.Linear):
             return False
+        if int(lstm.hidden_size) == 128:
+            h128_mode = self._h128_mode()
+            if h128_mode in {"", "native", "fallback", "pytorch", "off", "disable", "disabled"}:
+                return False
+            if h128_mode not in {
+                "best", "auto", "recur_gemm", "gemm_scan", "h128_recur_gemm",
+                "persistent_scalar", "scalar",
+                "cached_p4_b2_fstate_static", "cached_b2_fstate_static", "h128_b2_fstate_static", "fstate_static",
+            }:
+                raise ValueError(
+                    "PERSISTENT_LSTM_HIP_H128_MODE must be one of: "
+                    "native, best, recur_gemm, persistent_scalar"
+                )
         ext = load_extension()
         return (
             ext is not None and
@@ -121,7 +179,7 @@ class NativeModuleFallback(nn.Module):
                 ]
             )
         params.extend([linear.weight, linear.bias])
-        key_parts: list[object] = []
+        key_parts: list[object] = [self._h128_mode()]
         for tensor in params:
             key_parts.extend(
                 (
@@ -147,8 +205,16 @@ class NativeModuleFallback(nn.Module):
             weight_hh: list[torch.Tensor] = []
             bias: list[torch.Tensor] = []
             for layer_idx in range(lstm.num_layers):
-                weight_ih.append(getattr(lstm, f"weight_ih_l{layer_idx}").contiguous())
-                weight_hh.append(getattr(lstm, f"weight_hh_l{layer_idx}").contiguous())
+                raw_weight_ih = getattr(lstm, f"weight_ih_l{layer_idx}")
+                raw_weight_hh = getattr(lstm, f"weight_hh_l{layer_idx}")
+                if int(lstm.hidden_size) == 128 and self._is_h128_recur_gemm_mode():
+                    weight_ih.append(raw_weight_ih.transpose(0, 1).contiguous())
+                else:
+                    weight_ih.append(raw_weight_ih.contiguous())
+                if int(lstm.hidden_size) == 128 and self._is_h128_recur_gemm_mode():
+                    weight_hh.append(raw_weight_hh.transpose(0, 1).contiguous())
+                else:
+                    weight_hh.append(raw_weight_hh.contiguous())
                 bias.append(
                     (
                         getattr(lstm, f"bias_ih_l{layer_idx}") +
@@ -168,7 +234,7 @@ class NativeModuleFallback(nn.Module):
     def _should_use_uniform_batch_fast_path(self, x: torch.Tensor) -> bool:
         if not self._enable_uniform_batch or self.training:
             return False
-        mode = os.environ.get("PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH", "0").strip().lower()
+        mode = self._generic_uniform_batch_mode()
         if mode in {"0", "false", "no", "off", "disable", "disabled"}:
             return False
         if x.dim() != 3 or x.size(0) <= 1:
@@ -177,7 +243,7 @@ class NativeModuleFallback(nn.Module):
             return True
         if mode not in {"", "auto", "detect"}:
             raise ValueError(
-                "PERSISTENT_LSTM_HIP_UNIFORM_BATCH must be one of: auto, detect, assume, 1, 0"
+                "PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH must be one of: auto, detect, assume, 1, 0"
             )
 
         cache_key = (
@@ -197,6 +263,28 @@ class NativeModuleFallback(nn.Module):
         return self._uniform_input_cache_value
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if (
+            len(args) == 1 and
+            not kwargs and
+            isinstance(args[0], torch.Tensor) and
+            self._should_use_uniform_batch_fast_path(args[0])
+        ):
+            x = args[0]
+            output_batch_size = int(x.size(0))
+            out = self.module(x.narrow(0, 0, 1))
+            if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
+                print(
+                    "persistent_lstm_hip debug: "
+                    f"backend={self._backend_name}, "
+                    f"output_batch={output_batch_size}, "
+                    "compute_batch=1, "
+                    "uniform_batch_fast_path=True"
+                )
+                self._debug_reported = True
+            if isinstance(out, torch.Tensor) and out.size(0) == 1:
+                return out.expand(output_batch_size, *out.shape[1:]).contiguous()
+            return out
+
         if (
             len(args) == 1 and
             not kwargs and
@@ -222,34 +310,13 @@ class NativeModuleFallback(nn.Module):
                         f"input_size={int(args[0].size(2))}, "
                         f"hidden_size={int(self.module.lstm.hidden_size)}, "
                         f"num_layers={int(self.module.lstm.num_layers)}, "
-                        f"hidden_bucket={'h64' if int(self.module.lstm.hidden_size) == 64 else 'generic'}, "
-                        f"generic_projected_p4={int(self.module.lstm.hidden_size) <= 256}, "
+                        f"hidden_bucket={self._generic_projected_hidden_bucket_name()}, "
+                        f"generic_projected_partition={self._generic_projected_partition_name()}, "
                         "uniform_batch_fast_path=False"
                     )
                     self._debug_reported = True
                 return out
 
-        if (
-            len(args) == 1 and
-            not kwargs and
-            isinstance(args[0], torch.Tensor) and
-            self._should_use_uniform_batch_fast_path(args[0])
-        ):
-            x = args[0]
-            output_batch_size = int(x.size(0))
-            out = self.module(x.narrow(0, 0, 1))
-            if os.environ.get("PERSISTENT_LSTM_HIP_DEBUG", "0") == "1" and not self._debug_reported:
-                print(
-                    "persistent_lstm_hip debug: "
-                    f"backend={self._backend_name}, "
-                    f"output_batch={output_batch_size}, "
-                    "compute_batch=1, "
-                    "uniform_batch_fast_path=True"
-                )
-                self._debug_reported = True
-            if isinstance(out, torch.Tensor) and out.size(0) == 1:
-                return out.expand(output_batch_size, *out.shape[1:]).contiguous()
-            return out
         return self.module(*args, **kwargs)
 
 

@@ -1,190 +1,134 @@
 # Persistent LSTM HIP
 
-面向海光 DCU / AMD ROCm 平台的 LSTM 推理优化项目。目标是在不改变上层 PyTorch 模型写法、不牺牲 FP16 推理精度的前提下，为 `nn.LSTM + nn.Linear` 回归模型提供一个可扩展的 HIP 后端。
+面向海光 DCU / AMD ROCm 的 LSTM 推理优化项目。
 
-项目最初从一个固定业务 shape 开始：
+这个项目的目标不是替换 PyTorch 的所有 RNN 能力，而是针对业务里反复出现的
+`nn.LSTM + nn.Linear` 回归结构，做一条可持续扩展的 HIP 后端：先吃透固定形状，
+再按 `hidden_size` 分桶，把 NVIDIA cuDNN persistent RNN 那类思路逐步迁移到
+ROCm/HIP 环境里。
 
-- 输入: `[batch=512, seq_len=1000, input_size=5]`
-- LSTM: `num_layers=4, hidden_size=128, batch_first=True`
-- 输出: 取最后一个 timestep 的 top-layer hidden，再接 `Linear(128 -> 24)`
-- 推理精度: FP16
+当前重点是 FP16 inference。训练、反向传播、FP32/BF16 路径还没有纳入当前优化范围。
 
-后来逐步扩展成三类路径：
+## 当前阶段
 
-- 固定 shape 高性能路径: 面向最初的 `input=5, hidden=128, layers=4, output=24`
-- Uniform batch fast path: 面向 batch 内输入完全相同的场景
-- Hidden bucket 通用路径: 当前已支持 `hidden_size=64` 的半特化优化，其他参数保持动态
+| 阶段 | 范围 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| 固定形状 | `input=5, hidden=128, layers=4, output=24` | 已完成 | 最早的业务 shape，做了最深的手工特化 |
+| H64 bucket | `hidden_size=64`，`input_size/num_layers/output_dim` 动态 | 已完成 | 非全 1 输入也走 HIP 优化路径 |
+| H128 bucket | `hidden_size=128`，`input_size/num_layers/output_dim` 动态 | 进行中 | 当前有最快 `recur_gemm` 路径和少 kernel 的 `persistent_scalar` 研究路径 |
+| H256+ bucket | `hidden_size>=256` | 未开始 | 等 H128 路线稳定后再扩展 |
 
-![项目概览](image/image.png)
+## 架构
 
-## 当前结果
+![Persistent LSTM HIP architecture](image/architecture.png)
 
-以下结果来自 K100_AI / ROCm 环境，均为 100 次 forward 计时，吞吐量包含 batch size。
-
-| 路径 | shape | 时间 | 吞吐量 | 说明 |
-| --- | --- | ---: | ---: | --- |
-| NVIDIA A10 原生 `LSTM.py` | `5/128/4/24` | 约 `2.12s` | 约 `24125 samples/s` | cuDNN persistent LSTM |
-| K100_AI 原生 `LSTM.py` | `5/128/4/24` | 约 `9s` | 约 `5600 samples/s` | ROCm 原生通用路径 |
-| K100_AI 固定 shape HIP P4 | `5/128/4/24` | 约 `3.08s` | 约 `16600 samples/s` | 当前固定 shape 快路 |
-| K100_AI 原生 `LSTM.py` | `7/64/2/16` | 约 `1.94s` | 约 `26384 samples/s` | PyTorch/ROCm baseline |
-| K100_AI H64 bucket HIP | `7/64/2/16` | `0.8899s` | `57537 samples/s` | 当前 hidden=64 通用 bucket |
-
-当前 `hidden_size=64` 测试输出：
-
-```text
-backend: hip_generic_projected_lstm
-persistent_lstm_hip debug: backend=generic_projected, batch=512, seq_len=1000, input_size=7, hidden_size=64, num_layers=2, hidden_bucket=h64, generic_projected_p4=True, uniform_batch_fast_path=False
-accuracy_vs_native_lstm: max_abs=0.00012207, mean_abs=1.74046e-05, max_rel=0.0035503
-0.8898632526397705
-吞吐量(含batchsize): 57536.930363306616
-```
-
-这个结果没有依赖 uniform batch trick，`uniform_batch_fast_path=False`，因此是对非 uniform 输入也适用的真实 H64 优化路径。
-
-## 项目架构
-
-项目对外保留统一接口：
+对上层代码来说，入口保持简单：
 
 ```python
 from persistent_lstm_hip import convert_regressor_module
 
 model = LSTMRegressor().to("cuda:0").half().eval()
-model = convert_regressor_module(model).to("cuda:0").half().eval()
+model = convert_regressor_module(model)
+out = model(x)
 ```
 
-内部使用 dispatcher 根据模型结构选择不同 backend：
+dispatcher 会根据模型结构选择后端。没有命中 HIP 专用路径时，模型自动回到原生
+PyTorch，不会因为 shape 不匹配而不可用。
+
+## 核心实现
+
+### 1. 固定形状后端
+
+最早优化的是固定业务结构：
 
 ```text
-convert_regressor_module(model)
-        |
-        |-- 固定 shape: input=5, hidden=128, layers=4, output=24
-        |      -> hip_specialized_4layer_regressor
-        |      -> projected + uniform projected + P4 shuffle
-        |
-        |-- hidden_size=64, FP16, batch_first=True, 单向 LSTM
-        |      -> hip_generic_projected_lstm
-        |      -> hidden_bucket=h64
-        |
-        |-- 其他支持结构
-        |      -> generic projected 或 native PyTorch fallback
-        |
-        |-- 不支持结构
-               -> native_pytorch_unsupported_lstm
+batch       = 512
+seq_len     = 1000
+input_size  = 5
+hidden_size = 128
+num_layers  = 4
+output_dim  = 24
+dtype       = fp16
 ```
 
-当前支持的通用结构约束：
+这条路径做了最强特化：
 
-- `nn.LSTM + nn.Linear`
-- `batch_first=True`
-- `bidirectional=False`
-- `proj_size=0`
-- `bias=True`
-- FP16 inference
-- `linear.in_features == hidden_size`
-- 输入是 CUDA tensor，shape 为 `[batch, seq_len, input_size]`
+- Python 侧静态识别 4 层 LSTM + Linear。
+- recurrent 权重按 kernel 访问方式预打包。
+- input projection 交给矩阵乘，recurrent 部分交给自定义 HIP kernel。
+- P4 partition 把每个 hidden 的 recurrent dot-product 拆成 4 路并行，再用 shuffle 归约。
+- 对全 batch 输入完全一致的场景，启用 uniform batch fast path，减少重复计算。
+- 最后一层只保留最后一个 timestep，再接 `Linear(128 -> 24)`。
 
-## 三条优化路径
+这条路径快，但它依赖固定 shape，所以不是后续通用化的最终形态。
 
-### 1. 固定 Shape 高性能路径
+### 2. H64 bucket
 
-最初的业务 shape 是 `input=5, hidden=128, layers=4, output=24`。这条路径做了最深的特化：
-
-- 4 层 LSTM 在 Python 侧静态识别
-- recurrent 权重按 kernel 访问方式打包
-- input projection 与 recurrent 计算拆分
-- uniform batch 时只计算少量真实 batch，再 repeat 输出
-- P4 partition 把每个 hidden 的 recurrent dot-product 拆成 4 路并行
-- 最后一层融合 `Linear(128 -> 24)`
-
-这条路径非常快，但它依赖固定 shape，因此不是通用方案的全部。
-
-### 2. Uniform Batch Fast Path
-
-当前 benchmark 里输入常见写法是：
-
-```python
-x = torch.ones((batch_size, seq_length, input_size), device="cuda:0", dtype=torch.float16)
-```
-
-如果 batch 内每条序列完全相同，且初始 hidden/cell 相同，那么每条输出在数学上也相同。项目可以检测这种 uniform batch，只计算第一条或少量 batch，再把输出扩展回完整 batch。
-
-这个优化不改变数学结果，但它只适用于 batch 内输入完全一致的场景。为了避免误导通用性能评估，generic fallback 的 uniform 优化默认关闭，需要显式打开：
-
-```bash
-PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH=1 python LSTM-hip.py
-```
-
-固定 shape 的 uniform projected 路径仍然默认用于最初业务 benchmark。
-
-### 3. Hidden=64 Bucket
-
-这是目前通用化方向的第一条半特化路径。它不是写死 `input=7, layers=2, output=16`，而是按 hidden size 分桶：
+H64 是当前已经完成的通用 bucket。它只固定 `hidden_size == 64`，其余保持动态：
 
 ```text
-hidden_size = 64
-input_size  = 动态
-output_size = 动态
-num_layers  = 动态
-batch_size  = 动态
-seq_len     = 动态
+input_size  = dynamic
+num_layers  = dynamic
+output_dim  = dynamic
+batch_size  = dynamic
+seq_len     = dynamic
 ```
 
-H64 bucket 的核心实现：
+核心思路：
 
-- input projection 使用 `torch::matmul`
-- bias add 融合进 recurrent kernel，减少 PyTorch elementwise kernel
-- recurrent 权重在 kernel 开始时加载到线程局部数组
-- 每个 hidden 使用 P4 partition，4 个线程并行计算 recurrent dot-product
-- 使用 shuffle 做 4 路归约
-- 保留非 uniform batch 支持
+- 每层先用 `torch::matmul` 计算 input projection。
+- LSTM bias 合并后传入 recurrent kernel，减少额外 elementwise kernel。
+- recurrent kernel 内部使用 P4 partition，4 个线程协作计算一个 hidden 单元。
+- recurrent 权重在 kernel 内按固定 `hidden=64` 展开访问。
+- 中间层写完整序列，最后一层只写最后 hidden，再接动态 Linear。
+- generic uniform batch 默认关闭，因此非全 1 输入也能使用这条 HIP 路径。
 
-当前 H64 bucket 已经让 `7/64/2/16` 从原生 PyTorch 的约 `1.94s` 降到约 `0.89s`。
+实测 `7/64/2/16` 已经从原生 PyTorch 约 `1.94s` 降到约 `0.89s`。
 
-## 调优路线
+### 3. H128 bucket
 
-### 固定 Shape 阶段
-
-1. `monolithic` 早期版本很慢，约 `81s`，说明简单合并 4 层 kernel 不是答案。
-2. `interleaved` 降到约 `18s`，但仍慢于原生 DCU LSTM。
-3. `projected` 路径把 input projection 交给矩阵乘，把 recurrent 部分交给自定义 kernel，降到约 `5.5s`。
-4. uniform batch fast path 利用全 1 输入，只算少量真实 batch，进一步降低重复计算。
-5. P4 partition + shuffle 把 recurrent dot-product 从单线程串行拆成 4 路并行，固定 shape 降到约 `3.08s`。
-6. P8 实验更慢，说明更多 partition 不一定更好，同步、寄存器和 occupancy 成本会抵消收益。
-
-### 通用化阶段
-
-1. 先加 native PyTorch fallback，保证任意 shape 改动后不会不可用。
-2. 加 generic projected v1，支持动态 `input/hidden/layers/output`，但朴素 recurrent kernel 很慢，`7/64/2/16` 约 `21.7s`。
-3. 加 generic P4 recurrent，把 `hidden=64` 测试从约 `21.7s` 降到约 `8.37s`。
-4. 引入 H64 bucket，把 `hidden=64` 编译期特化，recurrent 权重缓存到线程局部数组，降到约 `1.14s`。
-5. 把 LSTM bias 从 `matmul + bias` 融入 recurrent kernel，elementwise 占比从约 `17.5%` 降到约 `10%`，总时间降到约 `0.918s`。
-6. 尝试 dynamic linear head fusion，但收益为负，已回退。
-7. H64 kernel 中 bias 预加载到局部变量，当前最好结果约 `0.8899s`。
-
-## 当前瓶颈
-
-H64 bucket 最新 profiler 显示，主要耗时集中在：
+H128 是当前正在做的阶段性目标。约束和 H64 一样：
 
 ```text
-persistent_lstm_h64_projected_layer_*: 约 88%
-input projection GEMM:                 约 10%
-其他 elementwise / copy:               很低
+hidden_size = 128 fixed
+input_size  = dynamic
+num_layers  = dynamic
+output_dim  = dynamic
 ```
 
-这说明当前主要瓶颈已经不是 PyTorch elementwise，也不是最后 linear，而是 H64 recurrent kernel 本身。
+现在保留两条有价值的路径：
 
-后续 H64 如果继续优化，重点应放在：
+| 模式 | 环境变量 | 作用 |
+| --- | --- | --- |
+| `native` | 默认 | H128 默认回到 PyTorch，作为稳定 baseline |
+| `best` / `recur_gemm` | `PERSISTENT_LSTM_HIP_H128_MODE=best` | 当前最快 H128 路径，用 GEMM 做 recurrent scan，再用 HIP pointwise 更新门控 |
+| `persistent_scalar` | `PERSISTENT_LSTM_HIP_H128_MODE=persistent_scalar` | 少 kernel 的 persistent recurrent 研究路径，kernel 启动次数少，但矩阵吞吐还不够 |
 
-- 减少每个 timestep 的 `__syncthreads()` 成本
-- 优化 shared memory 中 `h_cur` 的访问模式
-- 评估一个 block 处理多个 batch sample 的可行性
-- 继续调 wave64 下的 lane 分组、VGPR 占用和 occupancy
+`recur_gemm` 当前能跑到比原生 LSTM 更快的区间，但它会重新引入大量小 GEMM kernel。
+所以它是当前 H128 的速度基线，不是最终答案。H128 后续真正要解决的是：
 
-## 使用方法
+- 保持 `input_size/num_layers/output_dim` 动态。
+- 保持 H128 专用 recurrent kernel。
+- 逐步减少每个 timestep 的 kernel 启动。
+- 让 persistent 路径接近 GEMM 路径的吞吐。
 
-### 构建
+## 性能记录
 
-在 ROCm / HIP 环境中编译扩展：
+以下是当前项目里有代表性的结果，数字来自 K100_AI / ROCm 环境，主要用于说明阶段进展。
+
+| 路径 | Shape | 时间 | 吞吐量 | 状态 |
+| --- | --- | ---: | ---: | --- |
+| 原生 PyTorch LSTM | `5/128/4/24` | 约 `9s` | 约 `5600 samples/s` | baseline |
+| 固定形状 HIP | `5/128/4/24` | 约 `3.08s` | 约 `16600 samples/s` | 已完成 |
+| 原生 PyTorch LSTM | `7/64/2/16` | 约 `1.94s` | 约 `26384 samples/s` | baseline |
+| H64 HIP bucket | `7/64/2/16` | 约 `0.89s` | 约 `57537 samples/s` | 已完成 |
+| 原生 PyTorch LSTM | `7/128/2/16` | 约 `3.94s` 到 `4.07s` | 约 `12500` 到 `13000 samples/s` | H128 baseline |
+| H128 `recur_gemm` | `7/128/2/16` | 约 `2.9s` 到 `4.1s` | 最高约 `15954 samples/s` | 当前最快 |
+| H128 `persistent_scalar` | `7/128/2/16` | 约 `5.86s` | 约 `8730 samples/s` | 少 kernel 研究路径 |
+
+## 使用
+
+构建扩展：
 
 ```bash
 cd persistent_lstm_hip
@@ -192,25 +136,41 @@ python setup.py build_ext --inplace
 cd ..
 ```
 
-### 运行
+运行原生 baseline：
+
+```bash
+python LSTM.py
+```
+
+运行 HIP 包装版本：
 
 ```bash
 python LSTM-hip.py
 ```
 
-打开 debug：
+打印实际命中的后端：
 
 ```bash
 PERSISTENT_LSTM_HIP_DEBUG=1 python LSTM-hip.py
 ```
 
-关闭精度对比，只测速度：
+测试 H128 当前最快路径：
 
 ```bash
-PERSISTENT_LSTM_HIP_ACCURACY=0 python LSTM-hip.py
+PERSISTENT_LSTM_HIP_DEBUG=1 \
+PERSISTENT_LSTM_HIP_H128_MODE=best \
+python LSTM-hip.py
 ```
 
-禁用 HIP 转换，回到原生 PyTorch：
+测试 H128 persistent scalar 路径：
+
+```bash
+PERSISTENT_LSTM_HIP_DEBUG=1 \
+PERSISTENT_LSTM_HIP_H128_MODE=persistent_scalar \
+python LSTM-hip.py
+```
+
+关闭 HIP 转换，强制回到 PyTorch：
 
 ```bash
 USE_PERSISTENT_LSTM_HIP=0 python LSTM-hip.py
@@ -220,18 +180,13 @@ USE_PERSISTENT_LSTM_HIP=0 python LSTM-hip.py
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `USE_PERSISTENT_LSTM_HIP` | `1` | 是否启用 HIP 转换 |
-| `PERSISTENT_LSTM_HIP_BACKEND` | `auto` | 固定 shape 路径选择，可选 `auto`、`projected`、`interleaved`、`monolithic` |
-| `PERSISTENT_LSTM_HIP_DEBUG` | `0` | 打印实际 backend 和 fast path 命中情况 |
-| `PERSISTENT_LSTM_HIP_ACCURACY` | `1` | 在 `LSTM-hip.py` 中打印原生 LSTM 精度对比 |
+| `USE_PERSISTENT_LSTM_HIP` | `1` | 是否启用 HIP 模型转换 |
+| `PERSISTENT_LSTM_HIP_DEBUG` | `0` | 打印实际 backend、bucket、partition 等信息 |
+| `PERSISTENT_LSTM_HIP_ACCURACY` | `1` | `LSTM-hip.py` 中是否和原生 LSTM 做精度对比 |
 | `PERSISTENT_LSTM_HIP_GENERIC_PROJECTED` | `1` | 是否启用 generic projected / hidden bucket 路径 |
-| `PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH` | `0` | 是否对 generic fallback 启用 uniform batch fast path |
-| `PERSISTENT_LSTM_HIP_UNIFORM_BATCH` | `auto` | 固定 shape 路径是否自动检测 uniform batch |
-| `PERSISTENT_LSTM_HIP_UNIFORM_COMPUTE_BATCH` | `16` | 固定 shape uniform fallback 计算 batch |
-| `PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED` | `1` | 固定 shape 是否启用 uniform projected 路径 |
-| `PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_P4` | `1` | 固定 shape 是否启用 P4 recurrent kernel |
-| `PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_P8` | `0` | 固定 shape P8 实验路径，K100_AI 上实测更慢 |
-| `PERSISTENT_LSTM_HIP_UNIFORM_PROJECTED_VIRTUAL_BATCH` | `4` | 固定 shape uniform projected 的虚拟 block 数 |
+| `PERSISTENT_LSTM_HIP_GENERIC_UNIFORM_BATCH` | `0` | generic 路径是否启用 uniform batch fast path，默认关闭 |
+| `PERSISTENT_LSTM_HIP_H128_MODE` | `native` | H128 路径选择：`native`、`best`、`recur_gemm`、`persistent_scalar` |
+| `PERSISTENT_LSTM_HIP_BACKEND` | `auto` | 固定形状后端选择，通常保持 `auto` |
 
 ## 目录结构
 
@@ -240,23 +195,14 @@ USE_PERSISTENT_LSTM_HIP=0 python LSTM-hip.py
 ├── LSTM.py
 ├── LSTM-hip.py
 ├── README.md
-├── image
-│   ├── image.png
-│   ├── LSTM-log.png
-│   └── LSTM-hip-log.png
-├── log
-│   ├── LSTM.log
-│   └── LSTM-hip.log
 └── persistent_lstm_hip
     ├── setup.py
     ├── csrc
     │   ├── bindings.cpp
     │   ├── persistent_lstm_op.cpp
-    │   ├── persistent_lstm_reference.cpp
     │   ├── persistent_lstm_hip.h
     │   └── persistent_lstm_hip.cu
     └── persistent_lstm_hip
-        ├── __init__.py
         ├── api.py
         ├── extension.py
         ├── model.py
@@ -264,18 +210,10 @@ USE_PERSISTENT_LSTM_HIP=0 python LSTM-hip.py
         └── reference.py
 ```
 
-## 后续计划
+## 路线图
 
-接下来不建议按完整 shape 写孤岛 kernel，而是继续沿 hidden bucket 策略扩展：
-
-1. 保持当前 `hidden=64` bucket 稳定。
-2. 做 `hidden=128` bucket，把最初固定 shape 的经验抽象出来，让更多 `hidden=128` 模型受益。
-3. 做 `hidden=256` bucket，验证更大 hidden 下 P4/P8 或其他 partition 策略。
-4. 建立 shape dispatcher / autotune 机制，根据 hidden、seq_len、batch、layers 自动选择路径。
-5. 对最高频业务 shape 继续保留深度 fused kernel，作为额外快速路径。
-
-最终目标不是写一个万能 kernel，而是形成类似 cuDNN 的结构：
-
-```text
-统一接口 + shape dispatcher + hidden bucket kernel + 高频 shape 特化 kernel + PyTorch fallback
-```
+1. 收敛 H128：把 `recur_gemm` 作为速度 baseline，把 `persistent_scalar` 作为少 kernel baseline。
+2. 继续分析 H128 hipprof/PMC：重点看 recurrent 矩阵吞吐、同步开销、寄存器压力和 kernel launch 数。
+3. 设计 H128 下一版 persistent kernel：目标是减少启动次数，同时接近 GEMM 的有效吞吐。
+4. H128 稳定后扩展到 H256 bucket。
+5. 后续再考虑 BF16/FP32、更多 shape、更多硬件上的自动选择策略。
