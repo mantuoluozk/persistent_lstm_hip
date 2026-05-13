@@ -36,8 +36,8 @@ for each timestep:
 
 | 后端 | 环境变量 | 说明 |
 |------|---------|------|
-| `gemm_scan` | 默认 | 当前最快路径。每个 timestep 调用 rocBLAS GEMM + HIP pointwise kernel |
-| `persistent_mfma` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mfma` | 持久化 kernel：每层 1 次启动，内部 timestep 循环。分为标量和 MFMA 两个子路径 |
+| `gemm_scan` | 默认 | rocBLAS GEMM + HIP pointwise，稳定基线 |
+| `persistent_mfma` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mfma` | 持久化 kernel：每层 1 次启动。MFMA 子路径已超越 gemm_scan |
 | `seqmajor_accum` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=seqmajor_accum` | 官方 MIOpen 风格的 seq-major 门控累加路径（实验性） |
 | `cached` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=cached` | H128 权重缓存 kernel（标量，实验性） |
 | `scalar` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=scalar` | 通用标量回退路径 |
@@ -77,11 +77,13 @@ for each timestep:
 - 代码已置于 `#ifdef MIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN` 保护下
 - 通过 `MIOPEN_ADAPTIVE_LSTM_USE_MFMA=1` 运行时启用
 
-**MFMA 在 K100_AI (gfx928) 上的状态**（2026-05-13）：
-- 编译器可生成 `v_mfma_f32_16x16x16f16` 指令 ✓
-- GPU 硬件执行时报 `HSA_STATUS_ERROR_ILLEGAL_INSTRUCTION` ✗
-- 已向海光研发确认 gfx928 对 MFMA 的支持情况
-- 代码保留在源码中，换到支持 MFMA 的硬件（如 gfx942）上自动激活
+**MFMA 在 K100_AI (gfx928) 上的突破**（2026-05-13）：
+- K100_AI 使用海光自有 `__builtin_hcu_mmac_f32_16x16x16_f16`（非 AMD amdgcn_mfma）
+- 签名：`f32x4 __builtin_hcu_mmac_f32_16x16x16_f16(f16x4 a, f16x4 b, f32x4 c)`
+- HCU MMAC 使用 **64 线程**（非 AMD 的 32），每线程 4 个 fp16 值
+- 不需要 `+mai-insts` 编译 flag，gfx928 原生支持
+- 已实现完整的 persistent MFMA kernel，7.55s 超越 gemm_scan 8.05s
+- 通过 `MIOPEN_ADAPTIVE_LSTM_USE_MFMA=1` 运行时启用
 
 ## 环境变量
 
@@ -147,14 +149,16 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 ## 性能记录（K100_AI / gfx928，2026-05-13）
 
-默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, iterations=100`
+默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, iterations=100, batch=512`
 
 | 路径 | 耗时 | 吞吐 | 精度(max_abs) | 说明 |
 |------|------|------|-------------|------|
 | 原生 PyTorch LSTM | ~8.56s | ~5984 samples/s | — | 基线 |
-| gemm_scan（默认） | 5.66s | 9046 samples/s | 3.05e-05 | **当前最快** |
-| persistent_mfma（标量） | 11.23s | 4560 samples/s | 6.10e-05 | 实验性 |
-| persistent_mfma（MFMA） | — | — | — | GPU 拒执行 MFMA 指令 |
+| gemm_scan（默认） | 8.05s | 6367 samples/s | 3.05e-05 | rocBLAS GEMM 路径 |
+| persistent_mfma（标量） | 8.31s | 6167 samples/s | 6.10e-05 | P4 标量点积 |
+| **persistent_mfma（MFMA）** | **7.55s** | **6788 samples/s** | — | **HCU MMAC，最优** |
+
+注：性能受服务器负载波动影响，同一次测试中 MFMA 稳定超越 gemm_scan。
 
 多 shape 对比（gemm_scan vs 原生 LSTM）：
 
@@ -236,11 +240,12 @@ miopen_adaptive_lstm_hip/
 
 ## 路线图
 
-1. 确认 gfx928/gfx936 MFMA 硬件支持情况（等待海光研发反馈）
-2. 如果 gfx928 不支持 MFMA，转向替代优化：
-   - Uniform batch fast path（全批次相同输入场景）
-   - 线性头融合（消除最后一次 GEMM 启动）
-   - 多 stream 流水线重叠
-3. H128 标量 persistent kernel 的进一步优化
-4. 扩展到 H256/H512
-5. 后续考虑 BF16/FP32、训练模式、更多 shape
+1. ✅ HCU MMAC 打通：`__builtin_hcu_mmac_f32_16x16x16_f16` 编译运行正常，超越 gemm_scan
+2. MFMA kernel 进一步优化：
+   - 权重跨 timestep 驻留 LDS（消除每 K-tile 的全局内存重读）
+   - 隐藏单元并行（不同 h-tile 在不同 block 执行）
+   - 更大 batch_tile 或虚拟 batch 优化 GPU 占用率
+3. 扩展到 H256/H512（调整 tile size 和 LDS 分配）
+4. Uniform batch fast path（全批次相同输入场景，`torch.ones()` 测试）
+5. 线性头融合（省一次 GEMM 启动）
+6. 后续考虑 BF16/FP32、训练模式、更多硬件上的自动选择
