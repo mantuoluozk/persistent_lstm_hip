@@ -3216,40 +3216,39 @@ mfma_f32x4 mfma_f32_16x16x16f16_call(mfma_f16x4 a, mfma_f16x4 b, mfma_f32x4 c) {
 
 #ifdef ADAPTIVE_LSTM_HAS_MFMA
 template <bool WriteSequence>
-__global__ void __launch_bounds__(512)
+__global__ void __launch_bounds__(256)
 adaptive_lstm_h128_mfma_persistent_kernel(
-    const gpu_half* __restrict__ gate_proj,  // [B, T, 512]
-    const gpu_half* __restrict__ weight_hh,  // [512, 128] native
-    const gpu_half* __restrict__ bias,       // [512]
-    gpu_half* __restrict__ h_state_io,       // [B, 128]
-    float* __restrict__ c_state_io,          // [B, 128]
-    gpu_half* __restrict__ out,              // [B, T, 128] or [B, 128]
+    const gpu_half* __restrict__ gate_proj,
+    const gpu_half* __restrict__ weight_hh,
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ h_state_io,
+    float* __restrict__ c_state_io,
+    gpu_half* __restrict__ out,
     int batch_size,
     int seq_len) {
 
   constexpr int kH = 128;
   constexpr int kGateSize = 512;
-  constexpr int kBatchTile = 4;
-  constexpr int kMfmaM = 16;
+  constexpr int kBatchTile = 16;
   constexpr int kMfmaK = 16;
   constexpr int kMfmaN = 16;
-  constexpr int kKTiles = kH / kMfmaK;      // 8
-  constexpr int kHtiles = kH / kMfmaM;      // 8
+  constexpr int kKTiles = kH / kMfmaK;
+  constexpr int kHtiles = kH / kMfmaK;
   constexpr int kGateRegions = 4;
-  constexpr int kColsPerHTile = kMfmaN * kGateRegions;  // 64
-  constexpr int kPad = kColsPerHTile + 4;   // padded LDS stride
+  constexpr int kColsPerHTile = kMfmaN * kGateRegions;
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
-  const int lane_id = tid & 31;
+  const int lane_id = tid & 63;
+  const int mfma_row = lane_id & 15;
+  const int mfma_col0 = (lane_id >> 4) * 4;
 
-  __shared__ gpu_half h_lds[kBatchTile * kH];           // 1 KB
-  __shared__ gpu_half h_next_lds[kBatchTile * kH];      // 1 KB
-  __shared__ gpu_half w_tile[kMfmaK * kPad];            // ~2.2 KB
-  __shared__ float recur_lds[kBatchTile * kColsPerHTile]; // 1 KB
-  __shared__ float cell_lds[kBatchTile * kH];           // 2 KB
+  __shared__ gpu_half h_lds[kBatchTile * kH];
+  __shared__ gpu_half h_next_lds[kBatchTile * kH];
+  __shared__ float cell_lds[kBatchTile * kH];
+  __shared__ float recur_h[kBatchTile * kColsPerHTile];
 
-  for (int i = tid; i < kBatchTile * kH; i += 512) {
+  for (int i = tid; i < kBatchTile * kH; i += 256) {
     h_lds[i] = __float2half(0.0f);
     h_next_lds[i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
@@ -3257,140 +3256,80 @@ adaptive_lstm_h128_mfma_persistent_kernel(
   __syncthreads();
 
   for (int t = 0; t < seq_len; ++t) {
-
     for (int ht = 0; ht < kHtiles; ++ht) {
-      const int h0 = ht * kMfmaM;
+      const int h0 = ht * kMfmaK;
 
-      for (int i = tid; i < kBatchTile * kColsPerHTile; i += 512) {
-        recur_lds[i] = 0.0f;
-      }
+      for (int i = tid; i < kBatchTile * kColsPerHTile; i += 256)
+        recur_h[i] = 0.0f;
       __syncthreads();
 
-      for (int kt = 0; kt < kKTiles; ++kt) {
-        const int k0 = kt * kMfmaK;
+      for (int r = 0; r < kGateRegions; ++r) {
+        mfma_f32x4 c_regs = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int gate_col = r * kH + h0;
 
-        // Load weight tile: 16 rows × 64 cols, gathered from 4 gate regions
-        for (int i = tid; i < kMfmaK * kColsPerHTile; i += 512) {
-          const int wr = i / kColsPerHTile;
-          const int wc = i - wr * kColsPerHTile;
-          const int gate_r = wc / kMfmaN;
-          const int col = wc - gate_r * kMfmaN;
-          const int w_row = k0 + wr;
-          const int w_col = gate_r * kH + h0 + col;
-          w_tile[wr * kPad + wc] = weight_hh[w_row * kH + w_col];
-        }
-        __syncthreads();
-
-        // For each gate region: run MFMA to accumulate recur
-        for (int r = 0; r < kGateRegions; ++r) {
+        for (int kt = 0; kt < kKTiles; ++kt) {
+          const int k0 = kt * kMfmaK;
           mfma_f16x4 a_regs, b_regs;
-          mfma_f32x4 c_regs = {0.0f, 0.0f, 0.0f, 0.0f};
-
-          // Load A from h_lds: 8 fp16 values per lane (4 _Float16 each)
-          // Lane row = lane_id & 15, col_group = (lane_id >> 4) * 8
-          {
-            const int row = lane_id & 15;
-            const int col0 = (lane_id >> 4) * 8;
-            const gpu_half* src = h_lds + row * kH + k0 + col0;
-            // Pack 4 consecutive fp16 values
-            a_regs[0] = (_Float16)half_to_float(src[0]);
-            a_regs[1] = (_Float16)half_to_float(src[1]);
-            a_regs[2] = (_Float16)half_to_float(src[2]);
-            a_regs[3] = (_Float16)half_to_float(src[3]);
-          }
-
-          // Load B from w_tile: same lane mapping, column-major
-          {
-            const int row = lane_id & 15;
-            const int col0 = (lane_id >> 4) * 8;
-            const int col_offset = r * kMfmaN;
-            const gpu_half* src = w_tile + row * kPad + col_offset + col0;
-            b_regs[0] = (_Float16)half_to_float(src[0]);
-            b_regs[1] = (_Float16)half_to_float(src[1]);
-            b_regs[2] = (_Float16)half_to_float(src[2]);
-            b_regs[3] = (_Float16)half_to_float(src[3]);
-          }
-
+          const gpu_half* sa = h_lds + mfma_row * kH + k0 + mfma_col0;
+          a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
+          a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
+          const int w_row = k0 + mfma_row;
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+3)*kH+w_row]);
           c_regs = mfma_f32_16x16x16f16_call(a_regs, b_regs, c_regs);
-
-          // Store accumulators to recur_lds
-          {
-            const int b_local = lane_id & 15;
-            const int g_base = (lane_id >> 4) * 4;
-            const int col_off = r * kMfmaN;
-            recur_lds[b_local * kColsPerHTile + col_off + g_base + 0] += c_regs[0];
-            recur_lds[b_local * kColsPerHTile + col_off + g_base + 1] += c_regs[1];
-            recur_lds[b_local * kColsPerHTile + col_off + g_base + 2] += c_regs[2];
-            recur_lds[b_local * kColsPerHTile + col_off + g_base + 3] += c_regs[3];
-          }
         }
-        __syncthreads();
+
+        const int b_local = lane_id & 15;
+        const int g_base = (lane_id >> 4) * 4;
+        const int off = r * kMfmaN;
+        recur_h[b_local*kColsPerHTile+off+g_base+0] = c_regs[0];
+        recur_h[b_local*kColsPerHTile+off+g_base+1] = c_regs[1];
+        recur_h[b_local*kColsPerHTile+off+g_base+2] = c_regs[2];
+        recur_h[b_local*kColsPerHTile+off+g_base+3] = c_regs[3];
       }
 
-      // Gate math
-      for (int i = tid; i < kBatchTile * kMfmaM; i += 512) {
-        const int b_local = i / kMfmaM;
-        const int h_off = i - b_local * kMfmaM;
+      for (int i = tid; i < kBatchTile * kMfmaK; i += 256) {
+        const int b_local = i / kMfmaK, h_off = i - b_local * kMfmaK;
         const int b = b0 + b_local;
         if (b >= batch_size) continue;
         const int h = h0 + h_off;
-
-        const int gate_base = (b * seq_len + t) * kGateSize;
-        const float gate_i = half_to_float(gate_proj[gate_base + h]);
-        const float gate_f = half_to_float(gate_proj[gate_base + h + kH]);
-        const float gate_g = half_to_float(gate_proj[gate_base + h + 2 * kH]);
-        const float gate_o = half_to_float(gate_proj[gate_base + h + 3 * kH]);
-
-        const float recur_i = recur_lds[b_local * kColsPerHTile + h_off];
-        const float recur_f = recur_lds[b_local * kColsPerHTile + kMfmaM + h_off];
-        const float recur_g = recur_lds[b_local * kColsPerHTile + 2 * kMfmaM + h_off];
-        const float recur_o = recur_lds[b_local * kColsPerHTile + 3 * kMfmaM + h_off];
-
-        const float bias_i = half_to_float(bias[h]);
-        const float bias_f = half_to_float(bias[h + kH]);
-        const float bias_g = half_to_float(bias[h + 2 * kH]);
-        const float bias_o = half_to_float(bias[h + 3 * kH]);
-
-        const float i_acc = gate_i + recur_i + bias_i;
-        const float f_acc = gate_f + recur_f + bias_f;
-        const float g_acc = gate_g + recur_g + bias_g;
-        const float o_acc = gate_o + recur_o + bias_o;
-
-        const float i_gate = sigmoidf_fast(i_acc);
-        const float f_gate = sigmoidf_fast(f_acc);
-        const float g_gate = tanhf(g_acc);
-        const float o_gate = sigmoidf_fast(o_acc);
-
-        const int cell_idx = b_local * kH + h;
-        const float c_prev = cell_lds[cell_idx];
-        const float c_next = f_gate * c_prev + i_gate * g_gate;
-        cell_lds[cell_idx] = c_next;
-        h_next_lds[b_local * kH + h] = float_to_half(o_gate * tanhf(c_next));
-
-        if (WriteSequence) {
-          out[(b * seq_len + t) * kH + h] = h_next_lds[b_local * kH + h];
-        }
+        const int gb = (b * seq_len + t) * kGateSize;
+        const float gi=half_to_float(gate_proj[gb+h]), gf=half_to_float(gate_proj[gb+h+kH]);
+        const float gg=half_to_float(gate_proj[gb+h+2*kH]), go=half_to_float(gate_proj[gb+h+3*kH]);
+        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMfmaK+h_off];
+        const float rg=recur_h[b_local*kColsPerHTile+2*kMfmaK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMfmaK+h_off];
+        const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
+        const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
+        const float ia=gi+ri+bi, fa=gf+rf+bf, ga=gg+rg+bg, oa=go+ro+bo;
+        const float ig=sigmoidf_fast(ia), fg=sigmoidf_fast(fa);
+        const float gg2=tanhf(ga), og=sigmoidf_fast(oa);
+        const int ci = b_local * kH + h;
+        const float cp = cell_lds[ci];
+        const float cn = fg * cp + ig * gg2;
+        cell_lds[ci] = cn;
+        h_next_lds[b_local*kH+h] = float_to_half(og * tanhf(cn));
+        if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kH+h];
       }
       __syncthreads();
     }
 
-    for (int i = tid; i < kBatchTile * kH; i += 512) {
+    for (int i = tid; i < kBatchTile * kH; i += 256)
       h_lds[i] = h_next_lds[i];
-    }
     __syncthreads();
   }
 
-  for (int i = tid; i < kBatchTile * kH; i += 512) {
-    const int b_local = i / kH;
-    const int h = i - b_local * kH;
-    const int b = b0 + b_local;
+  for (int i = tid; i < kBatchTile * kH; i += 256) {
+    const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
     if (b < batch_size) {
-      h_state_io[b * kH + h] = h_lds[i];
-      c_state_io[b * kH + h] = cell_lds[i];
+      h_state_io[b*kH+h] = h_lds[i];
+      c_state_io[b*kH+h] = cell_lds[i];
     }
   }
 }
 #endif  // ADAPTIVE_LSTM_HAS_MFMA
+
 
 // Wrapper function — selects between scalar and MFMA persistent kernels
 torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
@@ -3428,11 +3367,11 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
 
 #ifdef ADAPTIVE_LSTM_HAS_MFMA
   if (use_mfma) {
-    const int grid = (batch_size + 3) / 4;
+    const int grid = (batch_size + 15) / 16;
     if (write_sequence) {
       GPU_LAUNCH_KERNEL(
           (adaptive_lstm_h128_mfma_persistent_kernel<true>),
-          grid, 512, 0, 0,
+          grid, 256, 0, 0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
@@ -3443,7 +3382,7 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
     } else {
       GPU_LAUNCH_KERNEL(
           (adaptive_lstm_h128_mfma_persistent_kernel<false>),
-          grid, 512, 0, 0,
+          grid, 256, 0, 0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
@@ -3520,56 +3459,3 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
   return out;
 }
 
-torch::Tensor adaptive_lstm_hidden_update_partitioned_forward(
-    const torch::Tensor& gate_proj,
-    const torch::Tensor& weight_hh,
-    const torch::Tensor& bias,
-    bool write_sequence,
-    int64_t partitions) {
-  c10::InferenceMode inference_mode;
-  if (!(gate_proj.is_cuda() && weight_hh.is_cuda() && bias.is_cuda())) {
-    throw std::invalid_argument("adaptive partitioned hidden update expects CUDA/HIP tensors");
-  }
-  if (!(gate_proj.scalar_type() == torch::kFloat16 &&
-        weight_hh.scalar_type() == torch::kFloat16 &&
-        bias.scalar_type() == torch::kFloat16)) {
-    throw std::invalid_argument("adaptive partitioned hidden update currently expects FP16 tensors");
-  }
-  if (!(gate_proj.dim() == 3 && weight_hh.dim() == 2 && bias.dim() == 1)) {
-    throw std::invalid_argument("expected gate [B,T,4H], weight_hh [4H,H], bias [4H]");
-  }
-
-  auto gate = gate_proj.contiguous();
-  auto whh = weight_hh.contiguous();
-  auto b = bias.contiguous();
-  const int batch_size = static_cast<int>(gate.size(0));
-  const int seq_len = static_cast<int>(gate.size(1));
-  const int hidden_size = static_cast<int>(gate.size(2) / 4);
-  if (gate.size(2) != 4 * hidden_size ||
-      whh.size(0) != 4 * hidden_size ||
-      whh.size(1) != hidden_size ||
-      b.size(0) != 4 * hidden_size) {
-    throw std::invalid_argument("incompatible adaptive partitioned hidden update shapes");
-  }
-
-  auto out = write_sequence
-      ? torch::empty({batch_size, seq_len, hidden_size}, gate.options())
-      : torch::empty({batch_size, hidden_size}, gate.options());
-
-  const int parts = static_cast<int>(partitions);
-  int local_size = 1;
-  while (local_size < hidden_size * parts) {
-    local_size <<= 1;
-  }
-  local_size = std::min(local_size, 1024);
-
-  if (parts == 8) {
-    launch_partitioned_for_local_size<8>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
-  } else if (parts == 2) {
-    launch_partitioned_for_local_size<2>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
-  } else {
-    launch_partitioned_for_local_size<4>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
-  }
-  check_last_error();
-  return out;
-}
