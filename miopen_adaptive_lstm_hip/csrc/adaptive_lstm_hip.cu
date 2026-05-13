@@ -3203,12 +3203,14 @@ adaptive_lstm_h128_persistent_kernel(
 #endif
 
 #ifdef ADAPTIVE_LSTM_HAS_MFMA
+// HCU (Hygon Compute Unit) MMAC builtins — K100_AI / gfx928 native matrix instructions.
+// Use __builtin_hcu_mmac_f32_16x16x16_f16 instead of AMD's amdgcn_mfma variant.
 typedef _Float16 __attribute__((vector_size(8)))  mfma_f16x4;
 typedef float    __attribute__((vector_size(16))) mfma_f32x4;
 
 __device__ __forceinline__
 mfma_f32x4 mfma_f32_16x16x16f16_call(mfma_f16x4 a, mfma_f16x4 b, mfma_f32x4 c) {
-  return __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
+  return __builtin_hcu_mmac_f32_16x16x16_f16(a, b, c);
 }
 #endif
 

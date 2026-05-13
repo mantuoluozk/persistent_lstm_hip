@@ -29,11 +29,6 @@ if torch.version.hip is not None:
         "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_DIRECT_BLAS=1",
         "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN=1",
 
-        # Verified on gfx928 minimal test: enables v_mfma_f32_16x16x16f16
-        # Use = format to prevent PyTorch build system from merging -Xclang flags
-        "-Xclang=-target-feature",
-        "-Xclang=+mai-insts",
-
         "-Wno-return-type",
         "-Wno-unused-command-line-argument",
     ]
