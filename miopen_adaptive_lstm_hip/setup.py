@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -8,12 +9,39 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 ROOT = Path(__file__).parent
+
+# K100_AI = gfx928
+ROCM_ARCH = os.environ.get("PYTORCH_ROCM_ARCH", "gfx928").strip()
+
+CXX_ARGS = ["-O3", "-std=c++17"]
 NVCC_ARGS = ["-O3", "-std=c++17"]
 EXTRA_LINK_ARGS = []
+
 if torch.version.hip is not None:
-    NVCC_ARGS.append("--gpu-max-threads-per-block=256")
-    NVCC_ARGS.append("-DMIOPEN_ADAPTIVE_LSTM_ENABLE_DIRECT_BLAS=1")
+    os.environ["PYTORCH_ROCM_ARCH"] = ROCM_ARCH
+    os.environ["AMDGPU_TARGETS"] = ROCM_ARCH
+    os.environ["HCC_AMDGPU_TARGET"] = ROCM_ARCH
+
+    NVCC_ARGS += [
+        f"--offload-arch={ROCM_ARCH}",
+        "--gpu-max-threads-per-block=256",
+
+        "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_DIRECT_BLAS=1",
+        "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN=1",
+
+        # Verified on gfx928 minimal test: enables v_mfma_f32_16x16x16f16
+        # Use = format to prevent PyTorch build system from merging -Xclang flags
+        "-Xclang=-target-feature",
+        "-Xclang=+mai-insts",
+
+        "-Wno-return-type",
+        "-Wno-unused-command-line-argument",
+    ]
+
     EXTRA_LINK_ARGS.append("-lhipblas")
+
+print("ROCM_ARCH =", ROCM_ARCH)
+print("NVCC_ARGS =", NVCC_ARGS)
 
 
 setup(
@@ -27,7 +55,7 @@ setup(
                 str(ROOT / "csrc" / "adaptive_lstm_hip.cu"),
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": CXX_ARGS,
                 "nvcc": NVCC_ARGS,
             },
             extra_link_args=EXTRA_LINK_ARGS,

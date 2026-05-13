@@ -3197,11 +3197,8 @@ adaptive_lstm_h128_persistent_kernel(
 // gfx906/gfx926/gfx928/gfx936/gfx938 do NOT support MFMA.
 // ============================================================================
 
-// MFMA only enabled on gfx942+ where DTK generates valid MFMA that the GPU accepts.
-// gfx928/gfx936: DTK can generate MFMA with +mai-insts flag but GPU rejects
-//   (HSA_STATUS_ERROR_ILLEGAL_INSTRUCTION).
-// To experiment: add -Xclang=-target-feature -Xclang=+mai-insts to setup.py NVCC_ARGS.
-#if defined(__gfx942__) || defined(__gfx950__)
+// MFMA enabled only when setup.py explicitly passes -DMIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN=1
+#if defined(MIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN)
 #define ADAPTIVE_LSTM_HAS_MFMA 1
 #endif
 
