@@ -701,14 +701,14 @@ class AdaptiveLSTMRegressor(nn.Module):
                         out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
                         layer_input = ext.adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
                             gate,
-                            args.weight_hh_t,
+                            args.weight_hh,  # native [512,128] — persistent kernel uses same layout as cached_b4
                             args.bias,
                             workspace.h_state,
                             workspace.c_state,
                             out_workspace,
                             not is_last,
                             actual_gemm_scan_read_block,
-                            1 if int(os.environ.get("MIOPEN_ADAPTIVE_LSTM_FAST_ACT", "0")) else 0,
+                            0,
                         )
                         actual_gemm_scan_workspace = True
                     else:
@@ -720,7 +720,7 @@ class AdaptiveLSTMRegressor(nn.Module):
                             device=gate.device, dtype=gate.dtype)
                         layer_input = ext.adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
                             gate,
-                            args.weight_hh_t,
+                            args.weight_hh,  # native [512,128]
                             args.bias,
                             _h_state,
                             _c_state,
