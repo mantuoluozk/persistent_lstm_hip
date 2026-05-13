@@ -3043,21 +3043,18 @@ torch::Tensor adaptive_lstm_gemm_scan_update_forward_workspace(
 
 // ============================================================================
 // Persistent scalar recurrent kernel (H128)
-// One kernel launch per layer — eliminates per‑timestep GEMM + pointwise
-// dispatch overhead.  Uses the same P4 partitioned scalar dot‑product as the
-// proven cached_b4 kernel, so it compiles on all DTK versions.
+// One kernel launch per layer — eliminates per‑timestep dispatch overhead.
+// Uses P4 partitioned scalar dot‑product (same as cached_b4).
 // ============================================================================
 
-// Persistent H128 kernel: one launch, internal timestep loop, P4 scalar matmul.
-// Modeled on the proven cached_b4 kernel structure.
 template <int Partitions, bool WriteSequence, bool CheckTail>
 __global__ void __launch_bounds__(512)
 adaptive_lstm_h128_persistent_kernel(
     const gpu_half* __restrict__ gate_proj,  // [B, T, 512]
-    const gpu_half* __restrict__ weight_hh,  // [512, 128] native layout: 4H rows, H cols
+    const gpu_half* __restrict__ weight_hh,  // [512, 128] native layout
     const gpu_half* __restrict__ bias,       // [512]
-    gpu_half* __restrict__ h_state_io,       // [B, 128]  last h (workspace)
-    float* __restrict__ c_state_io,          // [B, 128]  last c (workspace)
+    gpu_half* __restrict__ h_state_io,       // [B, 128] workspace
+    float* __restrict__ c_state_io,          // [B, 128] workspace
     gpu_half* __restrict__ out,              // [B, T, 128] or [B, 128]
     int batch_size,
     int seq_len) {
@@ -3072,26 +3069,19 @@ adaptive_lstm_h128_persistent_kernel(
   const int h = tid / Partitions;
   const int partition = tid - h * Partitions;
 
-  // LDS: hidden states for the batch tile
   __shared__ float h_prev[kBatchTile * kH];
   __shared__ float h_next[kBatchTile * kH];
 
-  // Each thread caches its portion of the recurrent weight in registers.
-  // Weight layout: weight_hh is [512, 128].
-  // Thread owns h in [0, 31] (since 512/4=128 threads, each for 1 hidden unit).
-  // It loads weight for the 4 gates × kPerPartition elements.
   gpu_half i_w[kPerPartition];
   gpu_half f_w[kPerPartition];
   gpu_half g_w[kPerPartition];
   gpu_half o_w[kPerPartition];
 
-  // Pre-load bias for this hidden unit
   const gpu_half i_bias = bias[0 * kH + h];
   const gpu_half f_bias = bias[1 * kH + h];
   const gpu_half g_bias = bias[2 * kH + h];
   const gpu_half o_bias = bias[3 * kH + h];
 
-  // Pre-load recurrent weight chunk for this thread
 #pragma unroll
   for (int idx = 0; idx < kPerPartition; ++idx) {
     const int k = partition + idx * Partitions;
@@ -3101,7 +3091,6 @@ adaptive_lstm_h128_persistent_kernel(
     o_w[idx] = weight_hh[(3 * kH + h) * kH + k];
   }
 
-  // Per-batch-element cell state in registers
   float c_reg[kBatchTile];
 #pragma unroll
   for (int bt = 0; bt < kBatchTile; ++bt) {
@@ -3120,13 +3109,9 @@ adaptive_lstm_h128_persistent_kernel(
     float o_recur[kBatchTile];
 #pragma unroll
     for (int bt = 0; bt < kBatchTile; ++bt) {
-      i_recur[bt] = 0.0f;
-      f_recur[bt] = 0.0f;
-      g_recur[bt] = 0.0f;
-      o_recur[bt] = 0.0f;
+      i_recur[bt] = f_recur[bt] = g_recur[bt] = o_recur[bt] = 0.0f;
     }
 
-    // Compute recurrent dot product via P4 partitioned reduction
 #pragma unroll
     for (int idx = 0; idx < kPerPartition; ++idx) {
       const int k = partition + idx * Partitions;
@@ -3147,7 +3132,6 @@ adaptive_lstm_h128_persistent_kernel(
       }
     }
 
-    // Shuffle reduction
 #pragma unroll
     for (int bt = 0; bt < kBatchTile; ++bt) {
       i_recur[bt] = reduce_partition_sum<Partitions>(i_recur[bt]);
@@ -3156,21 +3140,16 @@ adaptive_lstm_h128_persistent_kernel(
       o_recur[bt] = reduce_partition_sum<Partitions>(o_recur[bt]);
     }
 
-    // Gate math + cell/hidden state update
     if (partition == 0) {
 #pragma unroll
       for (int bt = 0; bt < kBatchTile; ++bt) {
         const int b = b_base + bt;
         if (!CheckTail || b < batch_size) {
           const int gate_base = (b * seq_len + t) * kGateSize;
-          const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) +
-                              half_to_float(i_bias) + i_recur[bt];
-          const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) +
-                              half_to_float(f_bias) + f_recur[bt];
-          const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) +
-                              half_to_float(g_bias) + g_recur[bt];
-          const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) +
-                              half_to_float(o_bias) + o_recur[bt];
+          const float i_acc = half_to_float(gate_proj[gate_base + 0 * kH + h]) + half_to_float(i_bias) + i_recur[bt];
+          const float f_acc = half_to_float(gate_proj[gate_base + 1 * kH + h]) + half_to_float(f_bias) + f_recur[bt];
+          const float g_acc = half_to_float(gate_proj[gate_base + 2 * kH + h]) + half_to_float(g_bias) + g_recur[bt];
+          const float o_acc = half_to_float(gate_proj[gate_base + 3 * kH + h]) + half_to_float(o_bias) + o_recur[bt];
 
           const float i_gate = sigmoidf_fast(i_acc);
           const float f_gate = sigmoidf_fast(f_acc);
@@ -3187,7 +3166,6 @@ adaptive_lstm_h128_persistent_kernel(
     }
     __syncthreads();
 
-    // Copy h_next → h_prev for next timestep
     if (partition == 0) {
 #pragma unroll
       for (int bt = 0; bt < kBatchTile; ++bt) {
@@ -3200,7 +3178,6 @@ adaptive_lstm_h128_persistent_kernel(
     __syncthreads();
   }
 
-  // Writeback last state
   if (!WriteSequence && partition == 0) {
 #pragma unroll
     for (int bt = 0; bt < kBatchTile; ++bt) {
@@ -3213,7 +3190,206 @@ adaptive_lstm_h128_persistent_kernel(
   }
 }
 
-// Wrapper function
+// ============================================================================
+// MFMA-based persistent recurrent kernel (H128)
+// Uses the DTK MFMA builtin for the recurrent matmul.
+// Only compiled on architectures with mai-insts support (gfx942+).
+// gfx906/gfx926/gfx928/gfx936/gfx938 do NOT support MFMA.
+// ============================================================================
+
+#if defined(__gfx942__) || defined(__gfx950__)
+#define ADAPTIVE_LSTM_HAS_MFMA 1
+#endif
+
+#ifdef ADAPTIVE_LSTM_HAS_MFMA
+typedef _Float16 __attribute__((vector_size(8)))  mfma_f16x4;
+typedef float    __attribute__((vector_size(16))) mfma_f32x4;
+
+__device__ __forceinline__
+mfma_f32x4 mfma_f32_16x16x16f16_call(mfma_f16x4 a, mfma_f16x4 b, mfma_f32x4 c) {
+  return __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
+}
+#endif
+
+#ifdef ADAPTIVE_LSTM_HAS_MFMA
+template <bool WriteSequence>
+__global__ void __launch_bounds__(512)
+adaptive_lstm_h128_mfma_persistent_kernel(
+    const gpu_half* __restrict__ gate_proj,  // [B, T, 512]
+    const gpu_half* __restrict__ weight_hh,  // [512, 128] native
+    const gpu_half* __restrict__ bias,       // [512]
+    gpu_half* __restrict__ h_state_io,       // [B, 128]
+    float* __restrict__ c_state_io,          // [B, 128]
+    gpu_half* __restrict__ out,              // [B, T, 128] or [B, 128]
+    int batch_size,
+    int seq_len) {
+
+  constexpr int kH = 128;
+  constexpr int kGateSize = 512;
+  constexpr int kBatchTile = 4;
+  constexpr int kMfmaM = 16;
+  constexpr int kMfmaK = 16;
+  constexpr int kMfmaN = 16;
+  constexpr int kKTiles = kH / kMfmaK;      // 8
+  constexpr int kHtiles = kH / kMfmaM;      // 8
+  constexpr int kGateRegions = 4;
+  constexpr int kColsPerHTile = kMfmaN * kGateRegions;  // 64
+  constexpr int kPad = kColsPerHTile + 4;   // padded LDS stride
+
+  const int b0 = blockIdx.x * kBatchTile;
+  const int tid = threadIdx.x;
+  const int lane_id = tid & 31;
+
+  __shared__ gpu_half h_lds[kBatchTile * kH];           // 1 KB
+  __shared__ gpu_half h_next_lds[kBatchTile * kH];      // 1 KB
+  __shared__ gpu_half w_tile[kMfmaK * kPad];            // ~2.2 KB
+  __shared__ float recur_lds[kBatchTile * kColsPerHTile]; // 1 KB
+  __shared__ float cell_lds[kBatchTile * kH];           // 2 KB
+
+  for (int i = tid; i < kBatchTile * kH; i += 512) {
+    h_lds[i] = __float2half(0.0f);
+    h_next_lds[i] = __float2half(0.0f);
+    cell_lds[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+
+    for (int ht = 0; ht < kHtiles; ++ht) {
+      const int h0 = ht * kMfmaM;
+
+      for (int i = tid; i < kBatchTile * kColsPerHTile; i += 512) {
+        recur_lds[i] = 0.0f;
+      }
+      __syncthreads();
+
+      for (int kt = 0; kt < kKTiles; ++kt) {
+        const int k0 = kt * kMfmaK;
+
+        // Load weight tile: 16 rows × 64 cols, gathered from 4 gate regions
+        for (int i = tid; i < kMfmaK * kColsPerHTile; i += 512) {
+          const int wr = i / kColsPerHTile;
+          const int wc = i - wr * kColsPerHTile;
+          const int gate_r = wc / kMfmaN;
+          const int col = wc - gate_r * kMfmaN;
+          const int w_row = k0 + wr;
+          const int w_col = gate_r * kH + h0 + col;
+          w_tile[wr * kPad + wc] = weight_hh[w_row * kH + w_col];
+        }
+        __syncthreads();
+
+        // For each gate region: run MFMA to accumulate recur
+        for (int r = 0; r < kGateRegions; ++r) {
+          mfma_f16x4 a_regs, b_regs;
+          mfma_f32x4 c_regs = {0.0f, 0.0f, 0.0f, 0.0f};
+
+          // Load A from h_lds: 8 fp16 values per lane (4 _Float16 each)
+          // Lane row = lane_id & 15, col_group = (lane_id >> 4) * 8
+          {
+            const int row = lane_id & 15;
+            const int col0 = (lane_id >> 4) * 8;
+            const gpu_half* src = h_lds + row * kH + k0 + col0;
+            // Pack 4 consecutive fp16 values
+            a_regs[0] = (_Float16)half_to_float(src[0]);
+            a_regs[1] = (_Float16)half_to_float(src[1]);
+            a_regs[2] = (_Float16)half_to_float(src[2]);
+            a_regs[3] = (_Float16)half_to_float(src[3]);
+          }
+
+          // Load B from w_tile: same lane mapping, column-major
+          {
+            const int row = lane_id & 15;
+            const int col0 = (lane_id >> 4) * 8;
+            const int col_offset = r * kMfmaN;
+            const gpu_half* src = w_tile + row * kPad + col_offset + col0;
+            b_regs[0] = (_Float16)half_to_float(src[0]);
+            b_regs[1] = (_Float16)half_to_float(src[1]);
+            b_regs[2] = (_Float16)half_to_float(src[2]);
+            b_regs[3] = (_Float16)half_to_float(src[3]);
+          }
+
+          c_regs = mfma_f32_16x16x16f16_call(a_regs, b_regs, c_regs);
+
+          // Store accumulators to recur_lds
+          {
+            const int b_local = lane_id & 15;
+            const int g_base = (lane_id >> 4) * 4;
+            const int col_off = r * kMfmaN;
+            recur_lds[b_local * kColsPerHTile + col_off + g_base + 0] += c_regs[0];
+            recur_lds[b_local * kColsPerHTile + col_off + g_base + 1] += c_regs[1];
+            recur_lds[b_local * kColsPerHTile + col_off + g_base + 2] += c_regs[2];
+            recur_lds[b_local * kColsPerHTile + col_off + g_base + 3] += c_regs[3];
+          }
+        }
+        __syncthreads();
+      }
+
+      // Gate math
+      for (int i = tid; i < kBatchTile * kMfmaM; i += 512) {
+        const int b_local = i / kMfmaM;
+        const int h_off = i - b_local * kMfmaM;
+        const int b = b0 + b_local;
+        if (b >= batch_size) continue;
+        const int h = h0 + h_off;
+
+        const int gate_base = (b * seq_len + t) * kGateSize;
+        const float gate_i = half_to_float(gate_proj[gate_base + h]);
+        const float gate_f = half_to_float(gate_proj[gate_base + h + kH]);
+        const float gate_g = half_to_float(gate_proj[gate_base + h + 2 * kH]);
+        const float gate_o = half_to_float(gate_proj[gate_base + h + 3 * kH]);
+
+        const float recur_i = recur_lds[b_local * kColsPerHTile + h_off];
+        const float recur_f = recur_lds[b_local * kColsPerHTile + kMfmaM + h_off];
+        const float recur_g = recur_lds[b_local * kColsPerHTile + 2 * kMfmaM + h_off];
+        const float recur_o = recur_lds[b_local * kColsPerHTile + 3 * kMfmaM + h_off];
+
+        const float bias_i = half_to_float(bias[h]);
+        const float bias_f = half_to_float(bias[h + kH]);
+        const float bias_g = half_to_float(bias[h + 2 * kH]);
+        const float bias_o = half_to_float(bias[h + 3 * kH]);
+
+        const float i_acc = gate_i + recur_i + bias_i;
+        const float f_acc = gate_f + recur_f + bias_f;
+        const float g_acc = gate_g + recur_g + bias_g;
+        const float o_acc = gate_o + recur_o + bias_o;
+
+        const float i_gate = sigmoidf_fast(i_acc);
+        const float f_gate = sigmoidf_fast(f_acc);
+        const float g_gate = tanhf(g_acc);
+        const float o_gate = sigmoidf_fast(o_acc);
+
+        const int cell_idx = b_local * kH + h;
+        const float c_prev = cell_lds[cell_idx];
+        const float c_next = f_gate * c_prev + i_gate * g_gate;
+        cell_lds[cell_idx] = c_next;
+        h_next_lds[b_local * kH + h] = float_to_half(o_gate * tanhf(c_next));
+
+        if (WriteSequence) {
+          out[(b * seq_len + t) * kH + h] = h_next_lds[b_local * kH + h];
+        }
+      }
+      __syncthreads();
+    }
+
+    for (int i = tid; i < kBatchTile * kH; i += 512) {
+      h_lds[i] = h_next_lds[i];
+    }
+    __syncthreads();
+  }
+
+  for (int i = tid; i < kBatchTile * kH; i += 512) {
+    const int b_local = i / kH;
+    const int h = i - b_local * kH;
+    const int b = b0 + b_local;
+    if (b < batch_size) {
+      h_state_io[b * kH + h] = h_lds[i];
+      c_state_io[b * kH + h] = cell_lds[i];
+    }
+  }
+}
+#endif  // ADAPTIVE_LSTM_HAS_MFMA
+
+// Wrapper function — selects between scalar and MFMA persistent kernels
 torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
     const torch::Tensor& gate_proj,
     const torch::Tensor& weight_hh,
@@ -3244,6 +3420,42 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
 
   c_state.zero_();
 
+  // Use MFMA kernel when requested AND compiled for HIP (MFMA types defined)
+  const bool use_mfma = env_flag_enabled("MIOPEN_ADAPTIVE_LSTM_USE_MFMA", false);
+
+#ifdef ADAPTIVE_LSTM_HAS_MFMA
+  if (use_mfma) {
+    const int grid = (batch_size + 3) / 4;
+    if (write_sequence) {
+      GPU_LAUNCH_KERNEL(
+          (adaptive_lstm_h128_mfma_persistent_kernel<true>),
+          grid, 512, 0, 0,
+          reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+          reinterpret_cast<gpu_half*>(h_state.data_ptr<at::Half>()),
+          static_cast<float*>(c_state.data_ptr<float>()),
+          reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
+          batch_size, seq_len);
+    } else {
+      GPU_LAUNCH_KERNEL(
+          (adaptive_lstm_h128_mfma_persistent_kernel<false>),
+          grid, 512, 0, 0,
+          reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
+          reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()),
+          reinterpret_cast<gpu_half*>(h_state.data_ptr<at::Half>()),
+          static_cast<float*>(c_state.data_ptr<float>()),
+          reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()),
+          batch_size, seq_len);
+    }
+    check_last_error();
+    if (!write_sequence) return h_state;
+    return out;
+  }
+#endif
+
+  // Default: scalar persistent kernel
   const bool check_tail = (batch_size & 3) != 0;
   const int grid = (batch_size + 3) / 4;
 
