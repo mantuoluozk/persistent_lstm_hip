@@ -151,14 +151,21 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, iterations=100, batch=512`
 
-| 路径 | 耗时 | 吞吐 | 精度(max_abs) | 说明 |
-|------|------|------|-------------|------|
-| 原生 PyTorch LSTM | ~8.56s | ~5984 samples/s | — | 基线 |
-| gemm_scan（默认） | 8.05s | 6367 samples/s | 3.05e-05 | rocBLAS GEMM 路径 |
-| persistent_mfma（标量） | 8.31s | 6167 samples/s | 6.10e-05 | P4 标量点积 |
-| **persistent_mfma（MFMA）** | **7.55s** | **6788 samples/s** | — | **HCU MMAC，最优** |
+| 路径 | 耗时 | 吞吐 | 说明 |
+|------|------|------|------|
+| 原生 PyTorch LSTM | ~8.56s | ~5984 samples/s | 基线 |
+| gemm_scan（默认） | 7.65s | 6697 samples/s | rocBLAS GEMM |
+| persistent_mfma（标量） | 8.31s | 6167 samples/s | P4 标量 |
+| **persistent_mfma（MFMA）** | **7.34s** | **6982 samples/s** | **HCU MMAC 最优** |
 
-注：性能受服务器负载波动影响，同一次测试中 MFMA 稳定超越 gemm_scan。
+### MFMA 优化迭代记录
+
+| 迭代 | MFMA 耗时 | gemm_scan | 关键改动 |
+|------|----------|-----------|---------|
+| 初版 | 144s (bug) | 5.6s | batch_tile=4 OOB + 读反 weight + K-loop 未累加 |
+| 四修复 | 7.55s | 8.05s | weight 布局修正、K-loop 寄存器累加、batch_tile=16、按需加载 weight |
+| A fragment 复用 | 7.34s | 7.65s | h_lds tile 每 K-tile 只加载 1 次，4 gate 共享 |
+| Weight 跨 timestep | 8.78s (回退) | 7.72s | K-tile 外移导致同步开销增大，实验性保留 |
 
 多 shape 对比（gemm_scan vs 原生 LSTM）：
 
