@@ -3197,27 +3197,27 @@ adaptive_lstm_h128_persistent_kernel(
 // gfx906/gfx926/gfx928/gfx936/gfx938 do NOT support MFMA.
 // ============================================================================
 
-// MFMA enabled only when setup.py explicitly passes -DMIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN=1
-#if defined(MIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN)
-#define ADAPTIVE_LSTM_HAS_MFMA 1
+// MFMA enabled only when setup.py explicitly passes -DMIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN=1
+#if defined(MIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN)
+#define ADAPTIVE_LSTM_HAS_MMAC 1
 #endif
 
-#ifdef ADAPTIVE_LSTM_HAS_MFMA
+#ifdef ADAPTIVE_LSTM_HAS_MMAC
 // HCU (Hygon Compute Unit) MMAC builtins — K100_AI / gfx928 native matrix instructions.
 // Use __builtin_hcu_mmac_f32_16x16x16_f16 instead of AMD's amdgcn_mfma variant.
-typedef _Float16 __attribute__((vector_size(8)))  mfma_f16x4;
-typedef float    __attribute__((vector_size(16))) mfma_f32x4;
+typedef _Float16 __attribute__((vector_size(8)))  mmac_f16x4;
+typedef float    __attribute__((vector_size(16))) mmac_f32x4;
 
 __device__ __forceinline__
-mfma_f32x4 mfma_f32_16x16x16f16_call(mfma_f16x4 a, mfma_f16x4 b, mfma_f32x4 c) {
+mmac_f32x4 mmac_f32_16x16x16f16_call(mmac_f16x4 a, mmac_f16x4 b, mmac_f32x4 c) {
   return __builtin_hcu_mmac_f32_16x16x16_f16(a, b, c);
 }
 #endif
 
-#ifdef ADAPTIVE_LSTM_HAS_MFMA
+#ifdef ADAPTIVE_LSTM_HAS_MMAC
 template <bool WriteSequence>
 __global__ void __launch_bounds__(256)
-adaptive_lstm_h128_mfma_persistent_kernel(
+adaptive_lstm_h128_mmac_persistent_kernel(
     const gpu_half* __restrict__ gate_proj,
     const gpu_half* __restrict__ weight_hh,
     const gpu_half* __restrict__ bias,
@@ -3230,18 +3230,18 @@ adaptive_lstm_h128_mfma_persistent_kernel(
   constexpr int kH = 128;
   constexpr int kGateSize = 512;
   constexpr int kBatchTile = 16;
-  constexpr int kMfmaK = 16;
-  constexpr int kMfmaN = 16;
-  constexpr int kKTiles = kH / kMfmaK;
-  constexpr int kHtiles = kH / kMfmaK;
+  constexpr int kMmacK = 16;
+  constexpr int kMmacN = 16;
+  constexpr int kKTiles = kH / kMmacK;
+  constexpr int kHtiles = kH / kMmacK;
   constexpr int kGateRegions = 4;
-  constexpr int kColsPerHTile = kMfmaN * kGateRegions;
+  constexpr int kColsPerHTile = kMmacN * kGateRegions;
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
   const int lane_id = tid & 63;
-  const int mfma_row = lane_id & 15;
-  const int mfma_col0 = (lane_id >> 4) * 4;
+  const int mmac_row = lane_id & 15;
+  const int mmac_col0 = (lane_id >> 4) * 4;
 
   __shared__ gpu_half h_lds[kBatchTile * kH];
   __shared__ gpu_half h_next_lds[kBatchTile * kH];
@@ -3257,65 +3257,65 @@ adaptive_lstm_h128_mfma_persistent_kernel(
 
   for (int t = 0; t < seq_len; ++t) {
     for (int ht = 0; ht < kHtiles; ++ht) {
-      const int h0 = ht * kMfmaK;
+      const int h0 = ht * kMmacK;
 
       // 4 accumulators per gate, kept in registers across K-tiles
-      mfma_f32x4 acc_i = {0.0f, 0.0f, 0.0f, 0.0f};
-      mfma_f32x4 acc_f = {0.0f, 0.0f, 0.0f, 0.0f};
-      mfma_f32x4 acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
-      mfma_f32x4 acc_o = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_i = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_f = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_o = {0.0f, 0.0f, 0.0f, 0.0f};
 
       for (int kt = 0; kt < kKTiles; ++kt) {
-        const int k0 = kt * kMfmaK;
+        const int k0 = kt * kMmacK;
 
         // Load A (h_lds tile) once per K-tile
-        mfma_f16x4 a_regs;
+        mmac_f16x4 a_regs;
         {
-          const gpu_half* sa = h_lds + mfma_row * kH + k0 + mfma_col0;
+          const gpu_half* sa = h_lds + mmac_row * kH + k0 + mmac_col0;
           a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
           a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
         }
-        const int w_row = k0 + mfma_row;
+        const int w_row = k0 + mmac_row;
 
         // Gate i: load B, run MMAC
         {
-          mfma_f16x4 b_regs;
+          mmac_f16x4 b_regs;
           const int gc = 0*kH + h0;
-          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
-          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
-          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
-          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
-          acc_i = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_i);
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+3)*kH+w_row]);
+          acc_i = mmac_f32_16x16x16f16_call(a_regs, b_regs, acc_i);
         }
         // Gate f
         {
-          mfma_f16x4 b_regs;
+          mmac_f16x4 b_regs;
           const int gc = 1*kH + h0;
-          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
-          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
-          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
-          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
-          acc_f = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_f);
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+3)*kH+w_row]);
+          acc_f = mmac_f32_16x16x16f16_call(a_regs, b_regs, acc_f);
         }
         // Gate g
         {
-          mfma_f16x4 b_regs;
+          mmac_f16x4 b_regs;
           const int gc = 2*kH + h0;
-          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
-          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
-          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
-          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
-          acc_g = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_g);
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+3)*kH+w_row]);
+          acc_g = mmac_f32_16x16x16f16_call(a_regs, b_regs, acc_g);
         }
         // Gate o
         {
-          mfma_f16x4 b_regs;
+          mmac_f16x4 b_regs;
           const int gc = 3*kH + h0;
-          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
-          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
-          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
-          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
-          acc_o = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_o);
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mmac_col0+3)*kH+w_row]);
+          acc_o = mmac_f32_16x16x16f16_call(a_regs, b_regs, acc_o);
         }
       }  // k-tile
 
@@ -3323,35 +3323,35 @@ adaptive_lstm_h128_mfma_persistent_kernel(
       {
         const int bl = lane_id & 15;
         const int gb = (lane_id >> 4) * 4;
-        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+0] = acc_i[0];
-        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+1] = acc_i[1];
-        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+2] = acc_i[2];
-        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+3] = acc_i[3];
-        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+0] = acc_f[0];
-        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+1] = acc_f[1];
-        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+2] = acc_f[2];
-        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+3] = acc_f[3];
-        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+0] = acc_g[0];
-        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+1] = acc_g[1];
-        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+2] = acc_g[2];
-        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+3] = acc_g[3];
-        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+0] = acc_o[0];
-        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+1] = acc_o[1];
-        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+2] = acc_o[2];
-        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+3] = acc_o[3];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+3] = acc_o[3];
       }
 
       // Gate math (unchanged — reads from recur_h LDS)
-      for (int i = tid; i < kBatchTile * kMfmaK; i += 256) {
-        const int b_local = i / kMfmaK, h_off = i - b_local * kMfmaK;
+      for (int i = tid; i < kBatchTile * kMmacK; i += 256) {
+        const int b_local = i / kMmacK, h_off = i - b_local * kMmacK;
         const int b = b0 + b_local;
         if (b >= batch_size) continue;
         const int h = h0 + h_off;
         const int gb2 = (b * seq_len + t) * kGateSize;
         const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
         const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
-        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMfmaK+h_off];
-        const float rg=recur_h[b_local*kColsPerHTile+2*kMfmaK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMfmaK+h_off];
+        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMmacK+h_off];
+        const float rg=recur_h[b_local*kColsPerHTile+2*kMmacK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMmacK+h_off];
         const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
         const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
         const float ia=gi+ri+bi, fa=gf+rf+bf, ga=gg+rg+bg, oa=go+ro+bo;
@@ -3380,11 +3380,11 @@ adaptive_lstm_h128_mfma_persistent_kernel(
     }
   }
 }
-#endif  // ADAPTIVE_LSTM_HAS_MFMA
+#endif  // ADAPTIVE_LSTM_HAS_MMAC
 
 
 // Wrapper function — selects between scalar and MFMA persistent kernels
-torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
+torch::Tensor adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
     const torch::Tensor& gate_proj,
     const torch::Tensor& weight_hh,
     const torch::Tensor& bias,
@@ -3415,14 +3415,14 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
   c_state.zero_();
 
   // Use MFMA kernel when requested AND compiled for HIP (MFMA types defined)
-  const bool use_mfma = env_flag_enabled("MIOPEN_ADAPTIVE_LSTM_USE_MFMA", false);
+  const bool use_mmac = env_flag_enabled("MIOPEN_ADAPTIVE_LSTM_USE_MMAC", false);
 
-#ifdef ADAPTIVE_LSTM_HAS_MFMA
-  if (use_mfma) {
+#ifdef ADAPTIVE_LSTM_HAS_MMAC
+  if (use_mmac) {
     const int grid = (batch_size + 15) / 16;
     if (write_sequence) {
       GPU_LAUNCH_KERNEL(
-          (adaptive_lstm_h128_mfma_persistent_kernel<true>),
+          (adaptive_lstm_h128_mmac_persistent_kernel<true>),
           grid, 256, 0, 0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),
@@ -3433,7 +3433,7 @@ torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
           batch_size, seq_len);
     } else {
       GPU_LAUNCH_KERNEL(
-          (adaptive_lstm_h128_mfma_persistent_kernel<false>),
+          (adaptive_lstm_h128_mmac_persistent_kernel<false>),
           grid, 256, 0, 0,
           reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()),
           reinterpret_cast<const gpu_half*>(whh.data_ptr<at::Half>()),

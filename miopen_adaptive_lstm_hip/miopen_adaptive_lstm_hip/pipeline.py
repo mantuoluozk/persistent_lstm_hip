@@ -156,7 +156,7 @@ def choose_recurrent_kernel_plan(hidden_size: int, batch_size: int) -> Recurrent
             wave_tile_m=1,
             wave_tile_n=64,
             wave_tile_k=32,
-            notes=("future MFMA/XDLops recurrent tile",),
+            notes=("future MMAC/XDLops recurrent tile",),
         )
         return RecurrentKernelPlan(
             name="xdlops_recurrent_candidate",

@@ -27,7 +27,7 @@ if torch.version.hip is not None:
         "--gpu-max-threads-per-block=256",
 
         "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_DIRECT_BLAS=1",
-        "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_MFMA_BUILTIN=1",
+        "-DMIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN=1",
 
         "-Wno-return-type",
         "-Wno-unused-command-line-argument",

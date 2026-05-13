@@ -35,7 +35,7 @@ for each timestep:
 | 后端 | 环境变量 | 说明 |
 |------|---------|------|
 | `gemm_scan` | 默认 | rocBLAS GEMM + HIP pointwise，稳定基线 |
-| `persistent_mfma` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mfma` | 持久化 kernel：每层 1 次启动，MFMA 子路径已超越 gemm_scan |
+| `persistent_mmac` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mmac` | 持久化 kernel：每层 1 次启动，MFMA 子路径已超越 gemm_scan |
 | `seqmajor_accum` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=seqmajor_accum` | 官方 MIOpen 风格 seq-major 门控累加（实验性） |
 | `cached` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=cached` | H128 权重缓存 kernel，标量（实验性） |
 | `scalar` | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=scalar` | 通用标量回退 |
@@ -48,7 +48,7 @@ for each timestep:
 
 优点：rocBLAS GEMM（tensor core）吞吐最优。缺点：每层 1000 次 GEMM + 1000 次 pointwise 启动。
 
-### persistent_mfma（持久化 kernel，当前最优）
+### persistent_mmac（持久化 kernel，当前最优）
 
 每层仅 1 次 kernel 启动，消除 per-timestep 启动开销。分两个子路径：
 
@@ -57,17 +57,17 @@ for each timestep:
 
 HCU MMAC 关键发现：
 - K100_AI 使用海光自有 `__builtin_hcu_mmac_f32_16x16x16_f16`（非 AMD amdgcn_mfma）
-- 签名：`f32x4 mfma(f16x4 a, f16x4 b, f32x4 c)` — 返回值是 `f32x4`
+- 签名：`f32x4 mmac(f16x4 a, f16x4 b, f32x4 c)` — 返回值是 `f32x4`
 - HCU MMAC 使用 64 线程（AMD MFMA 用 32），每线程 4 个 fp16 值
 - 不需要 `+mai-insts` 编译 flag，gfx928 原生支持
-- 通过 `MIOPEN_ADAPTIVE_LSTM_USE_MFMA=1` 启用
+- 通过 `MIOPEN_ADAPTIVE_LSTM_USE_MMAC=1` 启用
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND` | `gemm_scan` | 后端选择 |
-| `MIOPEN_ADAPTIVE_LSTM_USE_MFMA` | `0` | persistent_mfma 是否启用 MFMA |
+| `MIOPEN_ADAPTIVE_LSTM_USE_MMAC` | `0` | persistent_mmac 是否启用 MFMA |
 | `MIOPEN_ADAPTIVE_LSTM_FAST_ACT` | `0` | 启用 `exp2f` 快速激活 |
 | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE` | `fp32` | 循环 GEMM 精度：`fp32`/`fp16`/`auto_fast`/`auto_aggressive` |
 | `MIOPEN_ADAPTIVE_LSTM_DEBUG` | `0` | 打印后端、kernel 等诊断信息 |
@@ -84,9 +84,9 @@ python setup.py build_ext --inplace
 # 默认 gemm_scan
 python run_adaptive_lstm.py
 
-# persistent_mfma + MFMA（最优）
-MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mfma \
-MIOPEN_ADAPTIVE_LSTM_USE_MFMA=1 \
+# persistent_mmac + MFMA（最优）
+MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mmac \
+MIOPEN_ADAPTIVE_LSTM_USE_MMAC=1 \
 python run_adaptive_lstm.py
 
 # 调试输出
@@ -110,8 +110,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 |------|------|------|------|
 | 原生 PyTorch LSTM | ~8.56s | ~5984 samples/s | 基线 |
 | gemm_scan（默认） | 7.65s | 6697 samples/s | rocBLAS GEMM |
-| persistent_mfma（标量） | 8.31s | 6167 samples/s | P4 标量 |
-| **persistent_mfma（MFMA）** | **7.34s** | **6982 samples/s** | **HCU MMAC 最优** |
+| persistent_mmac（标量） | 8.31s | 6167 samples/s | P4 标量 |
+| **persistent_mmac（MFMA）** | **7.34s** | **6982 samples/s** | **HCU MMAC 最优** |
 
 ### MFMA 优化迭代
 

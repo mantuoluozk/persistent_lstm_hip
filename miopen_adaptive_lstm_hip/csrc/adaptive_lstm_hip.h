@@ -111,7 +111,7 @@ torch::Tensor adaptive_lstm_h512_gate_accum_update_forward_workspace(
     bool write_sequence,
     int64_t read_block);
 
-torch::Tensor adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
+torch::Tensor adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
     const torch::Tensor& gate_proj,
     const torch::Tensor& weight_hh,
     const torch::Tensor& bias,

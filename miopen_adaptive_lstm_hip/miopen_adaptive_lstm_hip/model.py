@@ -100,9 +100,9 @@ def _recurrent_backend(ext, hidden_size: int) -> str:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND", "gemm_scan").strip().lower()
     if raw in {"", "auto", "best"}:
         raw = "gemm_scan"
-    if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mfma"}:
+    if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mmac"}:
         raise ValueError(
-            "MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND must be auto, seqmajor_accum, gemm_scan, cached, partitioned, scalar, or persistent_mfma"
+            "MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND must be auto, seqmajor_accum, gemm_scan, cached, partitioned, scalar, or persistent_mmac"
         )
     if (
         raw == "seqmajor_accum"
@@ -112,8 +112,8 @@ def _recurrent_backend(ext, hidden_size: int) -> str:
     if raw == "cached" and not _use_h128_cached_path(ext, hidden_size):
         return "partitioned"
     if (
-        raw == "persistent_mfma"
-        and not (hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_persistent_mfma_update_forward_workspace"))
+        raw == "persistent_mmac"
+        and not (hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_persistent_mmac_update_forward_workspace"))
     ):
         return "gemm_scan"
     return raw
@@ -585,11 +585,11 @@ class AdaptiveLSTMRegressor(nn.Module):
                     and hasattr(ext, "adaptive_lstm_h128_seqmajor_accum_update_forward")
                 )
                 use_h128_gemm_scan_workspace = (
-                    backend in {"gemm_scan", "persistent_mfma"}
+                    backend in {"gemm_scan", "persistent_mmac"}
                     and hidden_size == 128
                     and (
                         hasattr(ext, "adaptive_lstm_h128_gemm_scan_update_forward")
-                        or hasattr(ext, "adaptive_lstm_h128_persistent_mfma_update_forward_workspace")
+                        or hasattr(ext, "adaptive_lstm_h128_persistent_mmac_update_forward_workspace")
                     )
                     and _use_gemm_scan_workspace(ext)
                 )
@@ -690,16 +690,16 @@ class AdaptiveLSTMRegressor(nn.Module):
                     actual_kernel_name = "h128_seqmajor_accum"
                     actual_pipeline_name = "seqmajor_accum"
                 elif (
-                    backend == "persistent_mfma"
+                    backend == "persistent_mmac"
                     and hidden_size == 128
-                    and hasattr(ext, "adaptive_lstm_h128_persistent_mfma_update_forward_workspace")
+                    and hasattr(ext, "adaptive_lstm_h128_persistent_mmac_update_forward_workspace")
                 ):
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
                         plan.hidden_launch.read_block, hidden_size
                     )
                     if workspace is not None:
                         out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
-                        layer_input = ext.adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
+                        layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
                             gate,
                             args.weight_hh,  # native [512,128] — persistent kernel uses same layout as cached_b4
                             args.bias,
@@ -718,7 +718,7 @@ class AdaptiveLSTMRegressor(nn.Module):
                         _out = torch.empty(
                             (batch_size, seq_len, hidden_size) if not is_last else (batch_size, hidden_size),
                             device=gate.device, dtype=gate.dtype)
-                        layer_input = ext.adaptive_lstm_h128_persistent_mfma_update_forward_workspace(
+                        layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
                             gate,
                             args.weight_hh,  # native [512,128]
                             args.bias,
@@ -729,8 +729,8 @@ class AdaptiveLSTMRegressor(nn.Module):
                             actual_gemm_scan_read_block,
                             0,
                         )
-                    actual_kernel_name = "h128_persistent_mfma"
-                    actual_pipeline_name = "persistent_mfma"
+                    actual_kernel_name = "h128_persistent_mmac"
+                    actual_pipeline_name = "persistent_mmac"
                     layer_input_is_seqmajor = False
                 elif backend == "gemm_scan" and hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_gemm_scan_update_forward"):
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(

@@ -56,8 +56,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &adaptive_lstm_h512_gate_accum_update_forward_workspace,
       "MIOpen-inspired H512 gate-accumulated GEMM scan LSTM hidden update with caller workspace");
   m.def(
-      "adaptive_lstm_h128_persistent_mfma_update_forward_workspace",
-      &adaptive_lstm_h128_persistent_mfma_update_forward_workspace,
+      "adaptive_lstm_h128_persistent_mmac_update_forward_workspace",
+      &adaptive_lstm_h128_persistent_mmac_update_forward_workspace,
       "MIOpen-inspired H128 persistent MFMA LSTM hidden update with caller workspace");
   m.def(
       "adaptive_lstm_gemm_scan_update_forward_workspace",

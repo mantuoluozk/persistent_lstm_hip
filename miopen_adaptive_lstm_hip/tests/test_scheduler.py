@@ -53,7 +53,7 @@ def test_pow2_segmentation():
     assert [segment.size for segment in hidden_prop_segments(13)] == [8, 4, 1]
 
 
-def test_plan_selects_mfma_candidate_for_h128():
+def test_plan_selects_mmac_candidate_for_h128():
     plan = build_adaptive_plan(
         batch_size=512,
         seq_len=1000,
@@ -62,5 +62,5 @@ def test_plan_selects_mfma_candidate_for_h128():
         num_layers=2,
     )
     assert plan.use_dynamic_algo
-    assert plan.recurrent_algo == "adaptive_tiled_mfma_candidate"
+    assert plan.recurrent_algo == "adaptive_tiled_mmac_candidate"
 

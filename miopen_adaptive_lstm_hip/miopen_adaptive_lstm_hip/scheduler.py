@@ -89,7 +89,7 @@ def select_project_algo(hidden_size: int, use_dynamic_algo: bool) -> str:
     if not use_dynamic_algo:
         return "native_or_existing"
     if hidden_size % 64 == 0 and hidden_size >= 128:
-        return "adaptive_tiled_mfma_candidate"
+        return "adaptive_tiled_mmac_candidate"
     if hidden_size <= 256:
         return "adaptive_tiled_scalar"
     return "adaptive_gemm_scan"
@@ -123,7 +123,7 @@ def build_adaptive_plan(
         "input projection remains GEMM-backed",
         "recurrent update keeps the sequence loop inside the kernel",
     ]
-    if recurrent_algo == "adaptive_tiled_mfma_candidate":
+    if recurrent_algo == "adaptive_tiled_mmac_candidate":
         notes.append("hidden size is MFMA-friendly; use tiled recurrent prototype first")
     elif recurrent_algo == "adaptive_gemm_scan":
         notes.append("large hidden sizes should stay GEMM-scan until tiled MFMA is ready")
