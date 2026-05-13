@@ -3259,45 +3259,97 @@ adaptive_lstm_h128_mfma_persistent_kernel(
     for (int ht = 0; ht < kHtiles; ++ht) {
       const int h0 = ht * kMfmaK;
 
-      for (int i = tid; i < kBatchTile * kColsPerHTile; i += 256)
-        recur_h[i] = 0.0f;
-      __syncthreads();
+      // 4 accumulators per gate, kept in registers across K-tiles
+      mfma_f32x4 acc_i = {0.0f, 0.0f, 0.0f, 0.0f};
+      mfma_f32x4 acc_f = {0.0f, 0.0f, 0.0f, 0.0f};
+      mfma_f32x4 acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
+      mfma_f32x4 acc_o = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      for (int r = 0; r < kGateRegions; ++r) {
-        mfma_f32x4 c_regs = {0.0f, 0.0f, 0.0f, 0.0f};
-        const int gate_col = r * kH + h0;
+      for (int kt = 0; kt < kKTiles; ++kt) {
+        const int k0 = kt * kMfmaK;
 
-        for (int kt = 0; kt < kKTiles; ++kt) {
-          const int k0 = kt * kMfmaK;
-          mfma_f16x4 a_regs, b_regs;
+        // Load A (h_lds tile) once per K-tile
+        mfma_f16x4 a_regs;
+        {
           const gpu_half* sa = h_lds + mfma_row * kH + k0 + mfma_col0;
           a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
           a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
-          const int w_row = k0 + mfma_row;
-          b_regs[0]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+0)*kH+w_row]);
-          b_regs[1]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+1)*kH+w_row]);
-          b_regs[2]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+2)*kH+w_row]);
-          b_regs[3]=(_Float16)half_to_float(weight_hh[(gate_col+mfma_col0+3)*kH+w_row]);
-          c_regs = mfma_f32_16x16x16f16_call(a_regs, b_regs, c_regs);
         }
+        const int w_row = k0 + mfma_row;
 
-        const int b_local = lane_id & 15;
-        const int g_base = (lane_id >> 4) * 4;
-        const int off = r * kMfmaN;
-        recur_h[b_local*kColsPerHTile+off+g_base+0] = c_regs[0];
-        recur_h[b_local*kColsPerHTile+off+g_base+1] = c_regs[1];
-        recur_h[b_local*kColsPerHTile+off+g_base+2] = c_regs[2];
-        recur_h[b_local*kColsPerHTile+off+g_base+3] = c_regs[3];
+        // Gate i: load B, run MMAC
+        {
+          mfma_f16x4 b_regs;
+          const int gc = 0*kH + h0;
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
+          acc_i = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_i);
+        }
+        // Gate f
+        {
+          mfma_f16x4 b_regs;
+          const int gc = 1*kH + h0;
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
+          acc_f = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_f);
+        }
+        // Gate g
+        {
+          mfma_f16x4 b_regs;
+          const int gc = 2*kH + h0;
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
+          acc_g = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_g);
+        }
+        // Gate o
+        {
+          mfma_f16x4 b_regs;
+          const int gc = 3*kH + h0;
+          b_regs[0]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+0)*kH+w_row]);
+          b_regs[1]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+1)*kH+w_row]);
+          b_regs[2]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+2)*kH+w_row]);
+          b_regs[3]=(_Float16)half_to_float(weight_hh[(gc+mfma_col0+3)*kH+w_row]);
+          acc_o = mfma_f32_16x16x16f16_call(a_regs, b_regs, acc_o);
+        }
+      }  // k-tile
+
+      // Store accumulators to LDS for gate math (same layout as before)
+      {
+        const int bl = lane_id & 15;
+        const int gb = (lane_id >> 4) * 4;
+        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+0] = acc_i[0];
+        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+1] = acc_i[1];
+        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+2] = acc_i[2];
+        recur_h[bl*kColsPerHTile+ 0*kMfmaN+gb+3] = acc_i[3];
+        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+0] = acc_f[0];
+        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+1] = acc_f[1];
+        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+2] = acc_f[2];
+        recur_h[bl*kColsPerHTile+ 1*kMfmaN+gb+3] = acc_f[3];
+        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+0] = acc_g[0];
+        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+1] = acc_g[1];
+        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+2] = acc_g[2];
+        recur_h[bl*kColsPerHTile+ 2*kMfmaN+gb+3] = acc_g[3];
+        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+0] = acc_o[0];
+        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+1] = acc_o[1];
+        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+2] = acc_o[2];
+        recur_h[bl*kColsPerHTile+ 3*kMfmaN+gb+3] = acc_o[3];
       }
 
+      // Gate math (unchanged — reads from recur_h LDS)
       for (int i = tid; i < kBatchTile * kMfmaK; i += 256) {
         const int b_local = i / kMfmaK, h_off = i - b_local * kMfmaK;
         const int b = b0 + b_local;
         if (b >= batch_size) continue;
         const int h = h0 + h_off;
-        const int gb = (b * seq_len + t) * kGateSize;
-        const float gi=half_to_float(gate_proj[gb+h]), gf=half_to_float(gate_proj[gb+h+kH]);
-        const float gg=half_to_float(gate_proj[gb+h+2*kH]), go=half_to_float(gate_proj[gb+h+3*kH]);
+        const int gb2 = (b * seq_len + t) * kGateSize;
+        const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
+        const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
         const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMfmaK+h_off];
         const float rg=recur_h[b_local*kColsPerHTile+2*kMfmaK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMfmaK+h_off];
         const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
