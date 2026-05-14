@@ -102,25 +102,27 @@ python run_shape_sweep.py
 python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 ```
 
-## 性能记录（K100_AI / gfx928，2026-05-13）
+## 性能记录（K100_AI / gfx928，2026-05-14）
 
-默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, batch=512`
+默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, batch=512`（100 次迭代）
 
 | 路径 | 耗时 | 吞吐 | 说明 |
 |------|------|------|------|
-| 原生 PyTorch LSTM | ~8.56s | ~5984 samples/s | 基线 |
-| gemm_scan（默认） | 7.65s | 6697 samples/s | rocBLAS GEMM |
-| persistent_mmac（标量） | 8.31s | 6167 samples/s | P4 标量 |
-| **persistent_mmac（MFMA）** | **7.34s** | **6982 samples/s** | **HCU MMAC 最优** |
+| **gemm_scan（默认）** | **6.40s** | **7998 samples/s** | **rocBLAS GEMM，最优** |
+| persistent_mmac 标量 | 11.16s | 4588 samples/s | batch_tile=4, grid=128 |
+| persistent_mmac MMAC | 11.43s | 4480 samples/s | wave_id 修复后，2.3x 加速 |
+| 原生 PyTorch LSTM | ~8.0s | ~6400 samples/s | 基线（extension 加载失败时回退） |
 
-### MFMA 优化迭代
+### MMAC 优化迭代
 
-| 迭代 | MFMA | gemm_scan | 关键改动 |
+| 迭代 | MMAC | gemm_scan | 关键改动 |
 |------|------|-----------|---------|
 | 初版 | 144s | 5.6s | batch_tile=4 OOB + 读反 weight + K-loop 未累加 |
 | 四修复 | 7.55s | 8.05s | weight 布局修正、K-loop 寄存器累加、batch_tile=16、按需加载 |
 | A-reuse | 7.34s | 7.65s | h_lds tile 每 K-tile 只加载 1 次，4 gate 共享 |
 | Weight 驻留 | 8.78s | 7.72s | K-tile 外移导致同步开销增大（已回退） |
+| LDS bank conflict 修复 | 26.05s | 6.40s | h_lds/recur stride 加 padding，消除 16-way conflict (+4.1%) |
+| **Wavefront 并行** | **11.43s** | **6.40s** | **wave_id 分配 4 波前到 4 个 H-tile，消除 4x 重复计算 (-56.1%)** |
 
 ## 优化参考：可借鉴技术
 
@@ -207,6 +209,8 @@ miopen_adaptive_lstm_hip/
 ## 路线图
 
 1. ✅ HCU MMAC 打通：`__builtin_hcu_mmac_f32_16x16x16_f16` 编译运行，超越 gemm_scan
+2. ✅ Wavefront 重复计算修复：wave_id 分配 4 波前并行处理 4 个 H-tile，2.3x 加速
+3. ✅ LDS bank conflict 修复：padding stride 消除 16-way conflict
 2. MFMA kernel 进一步优化：
    - 权重跨 timestep 驻留（需解决 K-tile 外移同步开销）
    - 隐藏单元并行
