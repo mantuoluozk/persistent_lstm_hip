@@ -159,46 +159,6 @@ def _use_gemm_scan_workspace(ext) -> bool:
     )
 
 
-def _use_packed_weight() -> bool:
-    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_PACKED_WEIGHT", "0").strip().lower()
-    return raw not in {"0", "false", "no", "off", "disable", "disabled"}
-
-
-def pack_weight_hh_mmac(weight_hh: torch.Tensor) -> torch.Tensor:
-    """Pack weight_hh from native [512,128] to MMAC-friendly layout [65536].
-
-    native weight_hh[row=gate*128+h][col=k]: 4 gate regions spaced 128 rows apart
-    packed: [htile=8][ktile=8][K=16][gate=4][N_group=4][frag=4] flattened
-
-    Per (htile,ktile,K_row), 4 gates × 16 N values are contiguous (64 halfs).
-    Lane with (mmac_row, mmac_col0) reads packed[row_base + ng*16 + gate*4 + 0..3].
-    """
-    kH = 128
-    kMmacK = 16
-    kMmacN = 16
-    kHTiles = kH // kMmacK
-    kKTiles = kH // kMmacK
-    kGates = 4
-
-    assert weight_hh.shape == (kGates * kH, kH), f"Expected [{kGates*kH},{kH}], got {list(weight_hh.shape)}"
-
-    packed = weight_hh.new_zeros((kHTiles, kKTiles, kMmacK, kGates, kMmacN // 4, 4))
-
-    for ht in range(kHTiles):
-        h0 = ht * kMmacK
-        for kt in range(kKTiles):
-            k0 = kt * kMmacK
-            for k in range(kMmacK):
-                for gate in range(kGates):
-                    gc = gate * kH + h0
-                    for ng in range(kMmacN // 4):
-                        n0 = ng * 4
-                        for fi in range(4):
-                            packed[ht, kt, k, gate, ng, fi] = weight_hh[gc + n0 + fi, k0 + k]
-
-    return packed.reshape(-1).contiguous()
-
-
 def _use_gate_workspace() -> bool:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_GATE_WORKSPACE", "1").strip().lower()
     if raw in {"0", "false", "no", "off", "disable", "disabled"}:
@@ -369,7 +329,6 @@ class AdaptiveLSTMRegressor(nn.Module):
         self.linear = self.native_module.linear
         self._cache_key: tuple[object, ...] | None = None
         self._layer_args: tuple[AdaptiveLayerArgs, ...] | None = None
-        self._mmac_packed_weights: tuple[torch.Tensor, ...] | None = None
         self._linear_weight_t: torch.Tensor | None = None
         self._linear_bias: torch.Tensor | None = None
         self._debug_reported = False
@@ -430,9 +389,6 @@ class AdaptiveLSTMRegressor(nn.Module):
                     )
                 )
             self._layer_args = tuple(args)
-            self._mmac_packed_weights = tuple(
-                pack_weight_hh_mmac(arg.weight_hh) for arg in args
-            )
             self._linear_weight_t = self.linear.weight.transpose(0, 1).contiguous()
             self._linear_bias = self.linear.bias.contiguous()
             self._cache_key = key
@@ -803,30 +759,18 @@ class AdaptiveLSTMRegressor(nn.Module):
                 elif (
                     backend == "profile_variants"
                     and hidden_size == 128
-                    and (
-                        hasattr(ext, "adaptive_lstm_h128_mmac_profile_variant_forward_workspace")
-                        or hasattr(ext, "adaptive_lstm_h128_mmac_packed_variant_forward_workspace")
-                    )
+                    and hasattr(ext, "adaptive_lstm_h128_mmac_profile_variant_forward_workspace")
                 ):
                     variant = _profile_variant()
                     variant_names = {0: "mmac_only", 1: "mmac_bias", 2: "mmac_act", 3: "mmac_full"}
-                    use_packed = _use_packed_weight() and hasattr(ext, "adaptive_lstm_h128_mmac_packed_variant_forward_workspace")
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
                         plan.hidden_launch.read_block, hidden_size
                     )
-                    weight_tensor = (
-                        self._mmac_packed_weights[layer_idx] if use_packed else args.weight_hh
-                    )
-                    ext_fn = (
-                        ext.adaptive_lstm_h128_mmac_packed_variant_forward_workspace
-                        if use_packed
-                        else ext.adaptive_lstm_h128_mmac_profile_variant_forward_workspace
-                    )
                     if workspace is not None:
                         out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
-                        layer_input = ext_fn(
+                        layer_input = ext.adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
                             gate,
-                            weight_tensor,
+                            args.weight_hh,
                             args.bias,
                             workspace.h_state,
                             workspace.c_state,
@@ -844,9 +788,9 @@ class AdaptiveLSTMRegressor(nn.Module):
                             (batch_size, seq_len, hidden_size) if not is_last else (batch_size, hidden_size),
                             device=gate.device, dtype=gate.dtype)
                         _pout = torch.empty((batch_size, 512), device=gate.device, dtype=gate.dtype)
-                        layer_input = ext_fn(
+                        layer_input = ext.adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
                             gate,
-                            weight_tensor,
+                            args.weight_hh,
                             args.bias,
                             _h_state,
                             _c_state,
@@ -856,8 +800,8 @@ class AdaptiveLSTMRegressor(nn.Module):
                             actual_gemm_scan_read_block,
                             variant,
                         )
-                    actual_kernel_name = f"h128_profile_v{variant}_{variant_names.get(variant, '?')}{'_packed' if use_packed else ''}"
-                    actual_pipeline_name = "profile_variants_packed" if use_packed else "profile_variants"
+                    actual_kernel_name = f"h128_profile_v{variant}_{variant_names.get(variant, '?')}"
+                    actual_pipeline_name = "profile_variants"
                     layer_input_is_seqmajor = False
                 elif backend == "gemm_scan" and hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_gemm_scan_update_forward"):
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
