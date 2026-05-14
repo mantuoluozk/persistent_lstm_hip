@@ -3693,7 +3693,7 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   constexpr int kH = 128;
   constexpr int kGateSize = 512;
   constexpr int kMmacM = 16;               // MMAC M dimension (hardware)
-  constexpr int kBatchTile = 8;            // logical batch per block (split-B)
+  constexpr int kBatchTile = 4;            // logical batch per block (split-B)
   constexpr int kMmacK = 16;
   constexpr int kMmacN = 16;
   constexpr int kKTiles = kH / kMmacK;
@@ -4125,7 +4125,7 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
   c_state.zero_();
 
 #ifdef ADAPTIVE_LSTM_HAS_MMAC
-  const int grid = (batch_size + 7) / 8;  // split-B: kBatchTile=8
+  const int grid = (batch_size + 3) / 4;  // split-B: kBatchTile=4
 
 #define LAUNCH_PACKED_VARIANT(V, WS) \
   GPU_LAUNCH_KERNEL( \
