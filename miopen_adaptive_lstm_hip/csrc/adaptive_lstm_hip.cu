@@ -3718,17 +3718,20 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   const bool row_active = mmac_row < kBatchTile;
 
   // LDS rows sized for MMAC M=16; only first kBatchTile rows are valid
-  __shared__ gpu_half h_lds[kMmacM * kHStride];
-  __shared__ gpu_half h_next_lds[kMmacM * kHStride];
+  // Double-buffered h_state: h_cur for A-load, h_next for pointwise write
+  __shared__ gpu_half h_buf[2][kMmacM * kHStride];
   __shared__ float cell_lds[kMmacM * kHStride];
   __shared__ float recur_h[kWavesPerBlock * kBatchTile * kRecurStride];
 
   for (int i = tid; i < kMmacM * kHStride; i += 256) {
-    h_lds[i] = __float2half(0.0f);
-    h_next_lds[i] = __float2half(0.0f);
+    h_buf[0][i] = __float2half(0.0f);
+    h_buf[1][i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
   }
   __syncthreads();
+
+  gpu_half* h_cur = h_buf[0];
+  gpu_half* h_next = h_buf[1];
 
   for (int t = 0; t < seq_len; ++t) {
     for (int ht_base = 0; ht_base < kHtiles; ht_base += kWavesPerBlock) {
@@ -3748,11 +3751,11 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
         for (int kt = 0; kt < kKTiles; ++kt) {
           const int frag_base = ht_row_base + kt * kKTileStride + ng_offset;
 
-          // Load A from h_lds (padded stride to avoid bank conflicts)
+          // Load A from current h_state (double-buffered)
           mmac_f16x4 a_regs;
           {
             const int k0 = kt * kMmacK;
-            const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
+            const gpu_half* sa = h_cur + mmac_row * kHStride + k0 + mmac_col0;
             a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
             a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
           }
@@ -3842,10 +3845,10 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
             const float cp = cell_lds[ci];
             const float cn = fg * cp + ig * gg2;
             cell_lds[ci] = cn;
-            h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
-            if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
+            h_next[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
+            if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next[b_local*kHStride+h];
           } else {
-            h_next_lds[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
+            h_next[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
             if (t == seq_len - 1) {
               float v0, v1, v2, v3;
               if constexpr (Variant == 0) {
@@ -3866,20 +3869,17 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
       __syncthreads();
     }  // ht_group
 
-    for (int i = tid; i < kBatchTile * kH; i += 256) {
-      const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
-      if (b < batch_size) {
-        h_lds[b_local*kHStride+h] = h_next_lds[b_local*kHStride+h];
-      }
-    }
-    __syncthreads();
+    // Swap buffers: next timestep reads what we just wrote
+    gpu_half* tmp = h_cur;
+    h_cur = h_next;
+    h_next = tmp;
   }  // timestep
 
   if constexpr (Variant >= 3) {
     for (int i = tid; i < kBatchTile * kH; i += 256) {
       const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
       if (b < batch_size) {
-        h_state_io[b*kH+h] = h_lds[b_local*kHStride+h];
+        h_state_io[b*kH+h] = h_cur[b_local*kHStride+h];
         c_state_io[b*kH+h] = cell_lds[b_local*kHStride+h];
       }
     }
