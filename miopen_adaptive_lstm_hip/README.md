@@ -108,7 +108,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 | 路径 | 耗时 | 吞吐 | 说明 |
 |------|------|------|------|
-| **persistent_mmac packed (split-B B=4)** | **4.79s** | **10686 samples/s** | **batch_tile=4, grid=128, 最优** |
+| **persistent_mmac packed (P1 double-buf)** | **4.68s** | **10932 samples/s** | **双缓冲 h_state，消除每步 LDS 拷贝** |
+| persistent_mmac packed (split-B B=4) | 4.79s | 10686 samples/s | batch_tile=4, grid=128 |
 | persistent_mmac packed (split-B B=8) | 5.63s | 9094 samples/s | batch_tile=8, grid=64 |
 | gemm_scan（默认） | ~7.4s | ~6900 samples/s | rocBLAS GEMM tensor core |
 | persistent_mmac packed (B=16) | 7.54s | 6793 samples/s | wave_id + packed weight |
@@ -127,7 +128,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | Wavefront 并行 | 11.43s | 6.40s | wave_id 分配 4 波前到 4 个 H-tile，消除 4x 重复计算 (-56.1%) |
 | Weight pre-packing | 7.54s | 6.40s | packed [htile][ktile][krow][ngroup][gate][frag] + wave_id (-34.2%) |
 | Split-B (batch_tile=8) | 5.63s | 7.44s | grid 32→64，反超 gemm_scan 24% |
-| **Split-B (batch_tile=4)** | **4.79s** | **7.44s** | **grid 64→128，再降 15%，30x 加速** |
+| Split-B (batch_tile=4) | 4.79s | 7.44s | grid 64→128，再降 15% |
+| **Double-buffer h_state** | **4.68s** | **7.44s** | **指针交换替代全量拷贝，省 copy+syncthreads (-2.3%)** |
 
 ## 优化参考：可借鉴技术
 
