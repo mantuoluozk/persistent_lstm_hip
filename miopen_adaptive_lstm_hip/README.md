@@ -110,7 +110,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 |------|------|------|------|
 | **gemm_scan（默认）** | **6.40s** | **7998 samples/s** | **rocBLAS GEMM，最优** |
 | persistent_mmac 标量 | 11.16s | 4588 samples/s | batch_tile=4, grid=128 |
-| persistent_mmac MMAC | 11.43s | 4480 samples/s | wave_id 修复后，2.3x 加速 |
+| **persistent_mmac packed** | **7.54s** | **6793 samples/s** | **wave_id + packed weight，距 gemm_scan 仅 18%** |
+| persistent_mmac MMAC (unpacked) | 11.45s | 4477 samples/s | wave_id 修复后（对照） |
 | 原生 PyTorch LSTM | ~8.0s | ~6400 samples/s | 基线（extension 加载失败时回退） |
 
 ### MMAC 优化迭代
@@ -121,8 +122,9 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | 四修复 | 7.55s | 8.05s | weight 布局修正、K-loop 寄存器累加、batch_tile=16、按需加载 |
 | A-reuse | 7.34s | 7.65s | h_lds tile 每 K-tile 只加载 1 次，4 gate 共享 |
 | Weight 驻留 | 8.78s | 7.72s | K-tile 外移导致同步开销增大（已回退） |
-| LDS bank conflict 修复 | 26.05s | 6.40s | h_lds/recur stride 加 padding，消除 16-way conflict (+4.1%) |
-| **Wavefront 并行** | **11.43s** | **6.40s** | **wave_id 分配 4 波前到 4 个 H-tile，消除 4x 重复计算 (-56.1%)** |
+| LDS bank conflict | 26.05s | 6.40s | h_lds/recur stride 加 padding，消除 16-way conflict (+4.1%) |
+| Wavefront 并行 | 11.43s | 6.40s | wave_id 分配 4 波前到 4 个 H-tile，消除 4x 重复计算 (-56.1%) |
+| **Weight pre-packing** | **7.54s** | **6.40s** | **packed [htile][ktile][krow][ngroup][gate][frag] + wave_id (-34.2%)** |
 
 ## 优化参考：可借鉴技术
 
