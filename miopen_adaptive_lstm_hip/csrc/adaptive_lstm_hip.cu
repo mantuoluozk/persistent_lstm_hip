@@ -3692,7 +3692,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
 
   constexpr int kH = 128;
   constexpr int kGateSize = 512;
-  constexpr int kBatchTile = 16;
+  constexpr int kMmacM = 16;               // MMAC M dimension (hardware)
+  constexpr int kBatchTile = 8;            // logical batch per block (split-B)
   constexpr int kMmacK = 16;
   constexpr int kMmacN = 16;
   constexpr int kKTiles = kH / kMmacK;
@@ -3714,13 +3715,15 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   const int lane_id = tid & (kWaveSize - 1);
   const int mmac_row = lane_id & 15;
   const int mmac_col0 = (lane_id >> 4) * 4;
+  const bool row_active = mmac_row < kBatchTile;
 
-  __shared__ gpu_half h_lds[kBatchTile * kHStride];
-  __shared__ gpu_half h_next_lds[kBatchTile * kHStride];
-  __shared__ float cell_lds[kBatchTile * kHStride];
+  // LDS rows sized for MMAC M=16; only first kBatchTile rows are valid
+  __shared__ gpu_half h_lds[kMmacM * kHStride];
+  __shared__ gpu_half h_next_lds[kMmacM * kHStride];
+  __shared__ float cell_lds[kMmacM * kHStride];
   __shared__ float recur_h[kWavesPerBlock * kBatchTile * kRecurStride];
 
-  for (int i = tid; i < kBatchTile * kHStride; i += 256) {
+  for (int i = tid; i < kMmacM * kHStride; i += 256) {
     h_lds[i] = __float2half(0.0f);
     h_next_lds[i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
@@ -3779,25 +3782,27 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
           acc_o = mmac_f32_16x16x16f16_call(a_regs, b_o, acc_o);
         }  // K-tile
 
-        // Store accumulators to per-wave recur_h LDS scratch
-        const int bl = lane_id & 15;
-        const int gb = (lane_id >> 4) * 4;
-        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
-        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
-        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
-        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
-        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
-        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
-        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
-        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
-        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
-        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
-        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
-        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
-        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
-        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
-        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
-        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
+        // Store accumulators for active rows only (mmac_row < kBatchTile)
+        if (row_active) {
+          const int bl = lane_id & 15;
+          const int gb = (lane_id >> 4) * 4;
+          recur_wave[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
+          recur_wave[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
+          recur_wave[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
+          recur_wave[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
+          recur_wave[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
+          recur_wave[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
+          recur_wave[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
+          recur_wave[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
+          recur_wave[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
+          recur_wave[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
+          recur_wave[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
+          recur_wave[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
+          recur_wave[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
+          recur_wave[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
+          recur_wave[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
+          recur_wave[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
+        }
       }
       __syncthreads();
 
@@ -4120,7 +4125,7 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
   c_state.zero_();
 
 #ifdef ADAPTIVE_LSTM_HAS_MMAC
-  const int grid = (batch_size + 15) / 16;
+  const int grid = (batch_size + 7) / 8;  // split-B: kBatchTile=8
 
 #define LAUNCH_PACKED_VARIANT(V, WS) \
   GPU_LAUNCH_KERNEL( \
