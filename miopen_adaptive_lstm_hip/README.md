@@ -131,7 +131,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | Split-B (batch_tile=8) | 5.63s | 7.44s | grid 32→64，反超 gemm_scan 24% |
 | Split-B (batch_tile=4) | 4.79s | 7.44s | grid 64→128，再降 15% |
 | Double-buffer h_state | 4.68s | 7.44s | 指针交换替代全量拷贝，省 copy+syncthreads (-2.3%) |
-| **Reduce syncthreads** | **4.40s** | **7.44s** | **syncthreads 2→1/timestep，省 per-timestep barrier (-6.0%)** |
+| Reduce syncthreads | 4.40s | 7.44s | syncthreads 2→1/timestep，省 per-timestep barrier (-6.0%) |
+| **Batch-tile sweep** | **B=4 最优** | — | **B=16(7.5s)→8(5.6s)→4(4.4s)→2(6.8s)→1(12.7s)** |
 
 ## 优化参考：可借鉴技术
 
