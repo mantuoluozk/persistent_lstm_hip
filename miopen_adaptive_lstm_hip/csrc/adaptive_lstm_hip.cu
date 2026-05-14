@@ -1440,6 +1440,60 @@ void launch_partitioned_for_local_size(
 
 }  // namespace
 
+torch::Tensor adaptive_lstm_hidden_update_partitioned_forward(
+    const torch::Tensor& gate_proj,
+    const torch::Tensor& weight_hh,
+    const torch::Tensor& bias,
+    bool write_sequence,
+    int64_t partitions) {
+  c10::InferenceMode inference_mode;
+  if (!(gate_proj.is_cuda() && weight_hh.is_cuda() && bias.is_cuda())) {
+    throw std::invalid_argument("adaptive partitioned hidden update expects CUDA/HIP tensors");
+  }
+  if (!(gate_proj.scalar_type() == torch::kFloat16 &&
+        weight_hh.scalar_type() == torch::kFloat16 &&
+        bias.scalar_type() == torch::kFloat16)) {
+    throw std::invalid_argument("adaptive partitioned hidden update currently expects FP16 tensors");
+  }
+  if (!(gate_proj.dim() == 3 && weight_hh.dim() == 2 && bias.dim() == 1)) {
+    throw std::invalid_argument("expected gate [B,T,4H], weight_hh [4H,H], bias [4H]");
+  }
+
+  auto gate = gate_proj.contiguous();
+  auto whh = weight_hh.contiguous();
+  auto b = bias.contiguous();
+  const int batch_size = static_cast<int>(gate.size(0));
+  const int seq_len = static_cast<int>(gate.size(1));
+  const int hidden_size = static_cast<int>(gate.size(2) / 4);
+  if (gate.size(2) != 4 * hidden_size ||
+      whh.size(0) != 4 * hidden_size ||
+      whh.size(1) != hidden_size ||
+      b.size(0) != 4 * hidden_size) {
+    throw std::invalid_argument("incompatible adaptive partitioned hidden update shapes");
+  }
+
+  auto out = write_sequence
+      ? torch::empty({batch_size, seq_len, hidden_size}, gate.options())
+      : torch::empty({batch_size, hidden_size}, gate.options());
+
+  const int parts = static_cast<int>(partitions);
+  int local_size = 1;
+  while (local_size < hidden_size * parts) {
+    local_size <<= 1;
+  }
+  local_size = std::min(local_size, 1024);
+
+  if (parts == 8) {
+    launch_partitioned_for_local_size<8>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
+  } else if (parts == 2) {
+    launch_partitioned_for_local_size<2>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
+  } else {
+    launch_partitioned_for_local_size<4>(gate, whh, b, out, batch_size, seq_len, hidden_size, write_sequence, local_size);
+  }
+  check_last_error();
+  return out;
+}
+
 torch::Tensor adaptive_lstm_hidden_update_forward(
     const torch::Tensor& gate_proj,
     const torch::Tensor& weight_hh,
