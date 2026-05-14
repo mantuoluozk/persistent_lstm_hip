@@ -3644,6 +3644,199 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
   }
 }
 
+
+// Packed-weight variant kernel — B-load from pre-packed [65536] layout
+// Layout: [htile=8][ktile=8][K=16][gate=4][N_group=4][frag=4]
+// Per K_row: 4 gates × 4 N_groups × 4 frag = 64 halfs, contiguous
+template <bool WriteSequence, int Variant>
+__global__ void __launch_bounds__(256)
+adaptive_lstm_h128_mmac_packed_variant_kernel(
+    const gpu_half* __restrict__ gate_proj,  // [B, T, 512]
+    const gpu_half* __restrict__ packed_w,   // [65536] packed layout
+    const gpu_half* __restrict__ bias,
+    gpu_half* __restrict__ h_state_io,
+    float* __restrict__ c_state_io,
+    gpu_half* __restrict__ out,
+    gpu_half* __restrict__ profile_out,
+    int batch_size,
+    int seq_len) {
+
+  constexpr int kH = 128;
+  constexpr int kGateSize = 512;
+  constexpr int kBatchTile = 16;
+  constexpr int kMmacK = 16;
+  constexpr int kMmacN = 16;
+  constexpr int kKTiles = kH / kMmacK;
+  constexpr int kHtiles = kH / kMmacK;
+  constexpr int kGateRegions = 4;
+  constexpr int kColsPerHTile = kMmacN * kGateRegions;
+
+  constexpr int kRowStride = 64;           // 4 gates × 16 N
+  constexpr int kKTileStride = kMmacK * kRowStride;   // 1024
+  constexpr int kHTileStride = kKTiles * kKTileStride; // 8192
+
+  const int b0 = blockIdx.x * kBatchTile;
+  const int tid = threadIdx.x;
+  const int lane_id = tid & 63;
+  const int mmac_row = lane_id & 15;
+  const int mmac_col0 = (lane_id >> 4) * 4;
+
+  __shared__ gpu_half h_lds[kBatchTile * kH];
+  __shared__ gpu_half h_next_lds[kBatchTile * kH];
+  __shared__ float cell_lds[kBatchTile * kH];
+  __shared__ float recur_h[kBatchTile * kColsPerHTile];
+
+  for (int i = tid; i < kBatchTile * kH; i += 256) {
+    h_lds[i] = __float2half(0.0f);
+    h_next_lds[i] = __float2half(0.0f);
+    cell_lds[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int t = 0; t < seq_len; ++t) {
+    for (int ht = 0; ht < kHtiles; ++ht) {
+      const int h0 = ht * kMmacK;
+      const int ht_row_base = ht * kHTileStride + mmac_row * kRowStride;
+      const int ng = mmac_col0 >> 2;
+      const int ng_offset = ng * 16;
+
+      mmac_f32x4 acc_i = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_f = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
+      mmac_f32x4 acc_o = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      for (int kt = 0; kt < kKTiles; ++kt) {
+        const int frag_base = ht_row_base + kt * kKTileStride + ng_offset;
+
+        // Load A from h_lds (same as unpacked)
+        mmac_f16x4 a_regs;
+        {
+          const int k0 = kt * kMmacK;
+          const gpu_half* sa = h_lds + mmac_row * kH + k0 + mmac_col0;
+          a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
+          a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
+        }
+
+        // Load B from packed layout — all 4 gates contiguous per K_row
+        mmac_f16x4 b_i, b_f, b_g, b_o;
+        b_i[0]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 0]);
+        b_i[1]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 1]);
+        b_i[2]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 2]);
+        b_i[3]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 3]);
+        b_f[0]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 0]);
+        b_f[1]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 1]);
+        b_f[2]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 2]);
+        b_f[3]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 3]);
+        b_g[0]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 0]);
+        b_g[1]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 1]);
+        b_g[2]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 2]);
+        b_g[3]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 3]);
+        b_o[0]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 0]);
+        b_o[1]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 1]);
+        b_o[2]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 2]);
+        b_o[3]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 3]);
+
+        acc_i = mmac_f32_16x16x16f16_call(a_regs, b_i, acc_i);
+        acc_f = mmac_f32_16x16x16f16_call(a_regs, b_f, acc_f);
+        acc_g = mmac_f32_16x16x16f16_call(a_regs, b_g, acc_g);
+        acc_o = mmac_f32_16x16x16f16_call(a_regs, b_o, acc_o);
+      }  // K-tile
+
+      // Store accumulators to recur_h LDS (same as unpacked)
+      {
+        const int bl = lane_id & 15;
+        const int gb = (lane_id >> 4) * 4;
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+3] = acc_o[3];
+      }
+
+      // Pointwise section (same as unpacked)
+      for (int i = tid; i < kBatchTile * kMmacK; i += 256) {
+        const int b_local = i / kMmacK, h_off = i - b_local * kMmacK;
+        const int b = b0 + b_local;
+        if (b >= batch_size) continue;
+        const int h = h0 + h_off;
+        const int gb2 = (b * seq_len + t) * kGateSize;
+
+        const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
+        const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
+        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMmacK+h_off];
+        const float rg=recur_h[b_local*kColsPerHTile+2*kMmacK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMmacK+h_off];
+
+        float ia = gi + ri, fa = gf + rf, ga = gg + rg, oa = go + ro;
+
+        if constexpr (Variant >= 1) {
+          const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
+          const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
+          ia += bi; fa += bf; ga += bg; oa += bo;
+        }
+
+        float ig = 0, fg = 0, gg2 = 0, og = 0;
+        if constexpr (Variant >= 2) {
+          ig = sigmoidf_fast(ia);
+          fg = sigmoidf_fast(fa);
+          gg2 = tanhf(ga);
+          og = sigmoidf_fast(oa);
+        }
+
+        if constexpr (Variant >= 3) {
+          const int ci = b_local * kH + h;
+          const float cp = cell_lds[ci];
+          const float cn = fg * cp + ig * gg2;
+          cell_lds[ci] = cn;
+          h_next_lds[b_local*kH+h] = float_to_half(og * tanhf(cn));
+          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kH+h];
+        } else {
+          h_next_lds[b_local*kH+h] = float_to_half(sigmoidf_fast(ia));
+          if (t == seq_len - 1) {
+            float v0, v1, v2, v3;
+            if constexpr (Variant == 0) {
+              v0 = gi + ri; v1 = gf + rf; v2 = gg + rg; v3 = go + ro;
+            } else if constexpr (Variant == 1) {
+              v0 = ia; v1 = fa; v2 = ga; v3 = oa;
+            } else {
+              v0 = ig; v1 = fg; v2 = gg2; v3 = og;
+            }
+            profile_out[b*kGateSize + 0*kH + h] = float_to_half(v0);
+            profile_out[b*kGateSize + 1*kH + h] = float_to_half(v1);
+            profile_out[b*kGateSize + 2*kH + h] = float_to_half(v2);
+            profile_out[b*kGateSize + 3*kH + h] = float_to_half(v3);
+          }
+        }
+      }  // pointwise
+      __syncthreads();
+    }  // H-tile
+
+    for (int i = tid; i < kBatchTile * kH; i += 256)
+      h_lds[i] = h_next_lds[i];
+    __syncthreads();
+  }  // timestep
+
+  if constexpr (Variant >= 3) {
+    for (int i = tid; i < kBatchTile * kH; i += 256) {
+      const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
+      if (b < batch_size) {
+        h_state_io[b*kH+h] = h_lds[i];
+        c_state_io[b*kH+h] = cell_lds[i];
+      }
+    }
+  }
+}
+
 #endif  // ADAPTIVE_LSTM_HAS_MMAC
 
 
@@ -3840,6 +4033,79 @@ torch::Tensor adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
   check_last_error();
 #else
   throw std::runtime_error("MMAC profile variants require MIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN");
+#endif
+
+  if (!write_sequence) {
+    return h_state;
+  }
+  return out;
+}
+
+
+// Wrapper for packed-weight profile variants — B-load from pre-packed [65536] layout
+torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& bias,
+    torch::Tensor h_state,
+    torch::Tensor c_state,
+    torch::Tensor out,
+    torch::Tensor profile_out,
+    bool write_sequence,
+    int64_t read_block,
+    int64_t variant) {
+  c10::InferenceMode inference_mode;
+
+  auto gate = gate_proj.contiguous();
+  auto pkw = packed_weight.contiguous();
+  auto b = bias.contiguous();
+  auto pout = profile_out.contiguous();
+
+  const int batch_size = static_cast<int>(gate.size(0));
+  const int seq_len = static_cast<int>(gate.size(1));
+
+  if (gate.size(2) != 512 || pkw.size(0) != 65536 ||
+      b.size(0) != 512 || h_state.size(0) != batch_size || h_state.size(1) != 128 ||
+      c_state.size(0) != batch_size || c_state.size(1) != 128 ||
+      pout.size(0) != batch_size || pout.size(1) != 512) {
+    throw std::invalid_argument("adaptive H128 packed variant kernel received incompatible shapes");
+  }
+
+  (void)read_block;
+
+  c_state.zero_();
+
+#ifdef ADAPTIVE_LSTM_HAS_MMAC
+  const int grid = (batch_size + 15) / 16;
+
+#define LAUNCH_PACKED_VARIANT(V, WS) \
+  GPU_LAUNCH_KERNEL( \
+      (adaptive_lstm_h128_mmac_packed_variant_kernel<WS, V>), \
+      grid, 256, 0, 0, \
+      reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()), \
+      reinterpret_cast<const gpu_half*>(pkw.data_ptr<at::Half>()), \
+      reinterpret_cast<const gpu_half*>(b.data_ptr<at::Half>()), \
+      reinterpret_cast<gpu_half*>(h_state.data_ptr<at::Half>()), \
+      static_cast<float*>(c_state.data_ptr<float>()), \
+      reinterpret_cast<gpu_half*>(out.data_ptr<at::Half>()), \
+      reinterpret_cast<gpu_half*>(pout.data_ptr<at::Half>()), \
+      batch_size, seq_len);
+
+  if (variant == 0) {
+    if (write_sequence) { LAUNCH_PACKED_VARIANT(0, true) } else { LAUNCH_PACKED_VARIANT(0, false) }
+  } else if (variant == 1) {
+    if (write_sequence) { LAUNCH_PACKED_VARIANT(1, true) } else { LAUNCH_PACKED_VARIANT(1, false) }
+  } else if (variant == 2) {
+    if (write_sequence) { LAUNCH_PACKED_VARIANT(2, true) } else { LAUNCH_PACKED_VARIANT(2, false) }
+  } else {
+    if (write_sequence) { LAUNCH_PACKED_VARIANT(3, true) } else { LAUNCH_PACKED_VARIANT(3, false) }
+  }
+
+#undef LAUNCH_PACKED_VARIANT
+
+  check_last_error();
+#else
+  throw std::runtime_error("MMAC packed variants require MIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN");
 #endif
 
   if (!write_sequence) {
