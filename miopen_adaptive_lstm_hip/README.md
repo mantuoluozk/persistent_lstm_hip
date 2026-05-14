@@ -108,10 +108,11 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 | 路径 | 耗时 | 吞吐 | 说明 |
 |------|------|------|------|
-| **persistent_mmac packed (split-B)** | **5.63s** | **9094 samples/s** | **batch_tile=8, grid=64, 反超 gemm_scan 24%** |
+| **persistent_mmac packed (split-B B=4)** | **4.79s** | **10686 samples/s** | **batch_tile=4, grid=128, 最优** |
+| persistent_mmac packed (split-B B=8) | 5.63s | 9094 samples/s | batch_tile=8, grid=64 |
 | gemm_scan（默认） | ~7.4s | ~6900 samples/s | rocBLAS GEMM tensor core |
-| persistent_mmac packed (batch_tile=16) | 7.54s | 6793 samples/s | wave_id + packed weight |
-| persistent_mmac 标量 | 11.16s | 4588 samples/s | batch_tile=4, grid=128 |
+| persistent_mmac packed (B=16) | 7.54s | 6793 samples/s | wave_id + packed weight |
+| persistent_mmac 标量 | 11.16s | 4588 samples/s | batch_tile=4, grid=128, 标量运算 |
 | 原生 PyTorch LSTM | ~8.0s | ~6400 samples/s | 基线（extension 加载失败时回退） |
 
 ### MMAC 优化迭代
@@ -125,7 +126,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | LDS bank conflict | 26.05s | 6.40s | h_lds/recur stride 加 padding，消除 16-way conflict (+4.1%) |
 | Wavefront 并行 | 11.43s | 6.40s | wave_id 分配 4 波前到 4 个 H-tile，消除 4x 重复计算 (-56.1%) |
 | Weight pre-packing | 7.54s | 6.40s | packed [htile][ktile][krow][ngroup][gate][frag] + wave_id (-34.2%) |
-| **Split-B (batch_tile=8)** | **5.63s** | **7.44s** | **grid 32→64，MMAC 反超 gemm_scan 24%** |
+| Split-B (batch_tile=8) | 5.63s | 7.44s | grid 32→64，反超 gemm_scan 24% |
+| **Split-B (batch_tile=4)** | **4.79s** | **7.44s** | **grid 64→128，再降 15%，30x 加速** |
 
 ## 优化参考：可借鉴技术
 
@@ -211,9 +213,11 @@ miopen_adaptive_lstm_hip/
 
 ## 路线图
 
-1. ✅ HCU MMAC 打通：`__builtin_hcu_mmac_f32_16x16x16_f16` 编译运行，超越 gemm_scan
+1. ✅ HCU MMAC 打通：`__builtin_hcu_mmac_f32_16x16x16_f16` 编译运行
 2. ✅ Wavefront 重复计算修复：wave_id 分配 4 波前并行处理 4 个 H-tile，2.3x 加速
 3. ✅ LDS bank conflict 修复：padding stride 消除 16-way conflict
+4. ✅ Weight pre-packing：packed [htile][ktile][krow][ngroup][gate][frag] 布局
+5. ✅ Split-B (batch_tile=4)：grid=128，MMAC 4.79s 反超 gemm_scan 35%，累计 30x 加速
 2. MFMA kernel 进一步优化：
    - 权重跨 timestep 驻留（需解决 K-tile 外移同步开销）
    - 隐藏单元并行
