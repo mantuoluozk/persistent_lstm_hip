@@ -19,6 +19,7 @@ class AdaptiveLayerArgs:
     weight_hh: torch.Tensor
     weight_hh_t: torch.Tensor
     bias: torch.Tensor
+    packed_weight_hh: torch.Tensor | None = None
 
 
 @dataclass
@@ -264,6 +265,46 @@ def _profile_variant() -> int:
     raise ValueError("MIOPEN_ADAPTIVE_LSTM_PROFILE_VARIANT must be 0, 1, 2, 3, a, b, c, d, or full")
 
 
+
+
+def _use_packed_mmac(ext) -> bool:
+    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_MMAC_PACKED", "1").strip().lower()
+    if raw in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    if raw not in {"", "1", "true", "yes", "on", "auto"}:
+        raise ValueError("MIOPEN_ADAPTIVE_LSTM_MMAC_PACKED must be 1, 0, or auto")
+    return hasattr(ext, "adaptive_lstm_h128_mmac_packed_variant_forward_workspace")
+
+
+def _pack_h128_mmac_weight(weight_hh: torch.Tensor) -> torch.Tensor:
+    """Pack native [512,128] recurrent weight for HCU MMAC B-load.
+
+    Packed layout matches adaptive_lstm_h128_mmac_packed_variant_kernel:
+    [htile=8][ktile=8][krow=16][ngroup=4][gate=4][frag=4].
+    The pack is tiny (65536 fp16 values) and cached per layer/weight version.
+    """
+
+    if tuple(weight_hh.shape) != (512, 128):
+        raise ValueError("H128 MMAC weight pack expects weight_hh shape [512, 128]")
+    device = weight_hh.device
+    dtype = weight_hh.dtype
+    wh = weight_hh.detach().contiguous().cpu()
+    packed = torch.empty((65536,), dtype=dtype)
+    idx = 0
+    for ht in range(8):
+        h0 = ht * 16
+        for kt in range(8):
+            k0 = kt * 16
+            for krow in range(16):
+                src_k = k0 + krow
+                for ng in range(4):
+                    n0 = h0 + ng * 4
+                    for gate in range(4):
+                        src_row = gate * 128 + n0
+                        packed[idx:idx + 4] = wh[src_row:src_row + 4, src_k]
+                        idx += 4
+    return packed.to(device=device, dtype=dtype, non_blocking=False).contiguous()
+
 def _use_gate_accum_scan() -> bool:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_GATE_ACCUM", "0").strip().lower()
     if raw in {"0", "false", "no", "off", "disable", "disabled"}:
@@ -376,16 +417,22 @@ class AdaptiveLSTMRegressor(nn.Module):
         if self._cache_key != key or self._layer_args is None:
             args: list[AdaptiveLayerArgs] = []
             for layer_idx in range(self.lstm.num_layers):
+                weight_hh = getattr(self.lstm, f"weight_hh_l{layer_idx}").contiguous()
                 args.append(
                     AdaptiveLayerArgs(
                         weight_ih=getattr(self.lstm, f"weight_ih_l{layer_idx}").contiguous(),
                         weight_ih_t=getattr(self.lstm, f"weight_ih_l{layer_idx}").transpose(0, 1).contiguous(),
-                        weight_hh=getattr(self.lstm, f"weight_hh_l{layer_idx}").contiguous(),
+                        weight_hh=weight_hh,
                         weight_hh_t=getattr(self.lstm, f"weight_hh_l{layer_idx}").transpose(0, 1).contiguous(),
                         bias=(
                             getattr(self.lstm, f"bias_ih_l{layer_idx}")
                             + getattr(self.lstm, f"bias_hh_l{layer_idx}")
                         ).contiguous(),
+                        packed_weight_hh=(
+                            _pack_h128_mmac_weight(weight_hh)
+                            if int(self.lstm.hidden_size) == 128 and weight_hh.dtype == torch.float16 and weight_hh.is_cuda
+                            else None
+                        ),
                     )
                 )
             self._layer_args = tuple(args)
@@ -721,19 +768,36 @@ class AdaptiveLSTMRegressor(nn.Module):
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
                         plan.hidden_launch.read_block, hidden_size
                     )
+                    use_packed_mmac = _use_packed_mmac(ext) and args.packed_weight_hh is not None
                     if workspace is not None:
                         out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
-                        layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
-                            gate,
-                            args.weight_hh,  # native [512,128] — persistent kernel uses same layout as cached_b4
-                            args.bias,
-                            workspace.h_state,
-                            workspace.c_state,
-                            out_workspace,
-                            not is_last,
-                            actual_gemm_scan_read_block,
-                            0,
-                        )
+                        if use_packed_mmac:
+                            layer_input = ext.adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
+                                gate,
+                                args.packed_weight_hh,
+                                args.bias,
+                                workspace.h_state,
+                                workspace.c_state,
+                                out_workspace,
+                                workspace.recur,
+                                not is_last,
+                                actual_gemm_scan_read_block,
+                                3,
+                            )
+                            actual_kernel_name = "h128_persistent_mmac_packed"
+                            actual_pipeline_name = "persistent_mmac_packed"
+                        else:
+                            layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
+                                gate,
+                                args.weight_hh,  # native [512,128] — persistent kernel uses same layout as cached_b4
+                                args.bias,
+                                workspace.h_state,
+                                workspace.c_state,
+                                out_workspace,
+                                not is_last,
+                                actual_gemm_scan_read_block,
+                                0,
+                            )
                         actual_gemm_scan_workspace = True
                     else:
                         # Without workspace, create temporary tensors for the persistent kernel
@@ -742,19 +806,37 @@ class AdaptiveLSTMRegressor(nn.Module):
                         _out = torch.empty(
                             (batch_size, seq_len, hidden_size) if not is_last else (batch_size, hidden_size),
                             device=gate.device, dtype=gate.dtype)
-                        layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
-                            gate,
-                            args.weight_hh,  # native [512,128]
-                            args.bias,
-                            _h_state,
-                            _c_state,
-                            _out,
-                            not is_last,
-                            actual_gemm_scan_read_block,
-                            0,
-                        )
-                    actual_kernel_name = "h128_persistent_mmac"
-                    actual_pipeline_name = "persistent_mmac"
+                        if use_packed_mmac:
+                            _pout = torch.empty((batch_size, 512), device=gate.device, dtype=gate.dtype)
+                            layer_input = ext.adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
+                                gate,
+                                args.packed_weight_hh,
+                                args.bias,
+                                _h_state,
+                                _c_state,
+                                _out,
+                                _pout,
+                                not is_last,
+                                actual_gemm_scan_read_block,
+                                3,
+                            )
+                            actual_kernel_name = "h128_persistent_mmac_packed"
+                            actual_pipeline_name = "persistent_mmac_packed"
+                        else:
+                            layer_input = ext.adaptive_lstm_h128_persistent_mmac_update_forward_workspace(
+                                gate,
+                                args.weight_hh,  # native [512,128]
+                                args.bias,
+                                _h_state,
+                                _c_state,
+                                _out,
+                                not is_last,
+                                actual_gemm_scan_read_block,
+                                0,
+                            )
+                    if not use_packed_mmac:
+                        actual_kernel_name = "h128_persistent_mmac"
+                        actual_pipeline_name = "persistent_mmac"
                     layer_input_is_seqmajor = False
                 elif (
                     backend == "profile_variants"

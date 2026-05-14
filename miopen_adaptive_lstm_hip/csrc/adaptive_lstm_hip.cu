@@ -3701,6 +3701,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   constexpr int kColsPerHTile = kMmacN * kGateRegions;
   constexpr int kHStride = kH + 2;
   constexpr int kRecurStride = kColsPerHTile + 2;
+  constexpr int kWavesPerBlock = 4;
+  constexpr int kWaveSize = 64;
 
   constexpr int kRowStride = 64;           // 4 gates × 16 N
   constexpr int kKTileStride = kMmacK * kRowStride;   // 1024
@@ -3708,14 +3710,15 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
-  const int lane_id = tid & 63;
+  const int wave_id = tid / kWaveSize;
+  const int lane_id = tid & (kWaveSize - 1);
   const int mmac_row = lane_id & 15;
   const int mmac_col0 = (lane_id >> 4) * 4;
 
   __shared__ gpu_half h_lds[kBatchTile * kHStride];
   __shared__ gpu_half h_next_lds[kBatchTile * kHStride];
   __shared__ float cell_lds[kBatchTile * kHStride];
-  __shared__ float recur_h[kBatchTile * kRecurStride];
+  __shared__ float recur_h[kWavesPerBlock * kBatchTile * kRecurStride];
 
   for (int i = tid; i < kBatchTile * kHStride; i += 256) {
     h_lds[i] = __float2half(0.0f);
@@ -3725,132 +3728,138 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   __syncthreads();
 
   for (int t = 0; t < seq_len; ++t) {
-    for (int ht = 0; ht < kHtiles; ++ht) {
+    for (int ht_base = 0; ht_base < kHtiles; ht_base += kWavesPerBlock) {
+      const int ht = ht_base + wave_id;
       const int h0 = ht * kMmacK;
       const int ht_row_base = ht * kHTileStride + mmac_row * kRowStride;
       const int ng = mmac_col0 >> 2;
       const int ng_offset = ng * 16;
+      float* recur_wave = recur_h + wave_id * kBatchTile * kRecurStride;
 
       mmac_f32x4 acc_i = {0.0f, 0.0f, 0.0f, 0.0f};
       mmac_f32x4 acc_f = {0.0f, 0.0f, 0.0f, 0.0f};
       mmac_f32x4 acc_g = {0.0f, 0.0f, 0.0f, 0.0f};
       mmac_f32x4 acc_o = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      for (int kt = 0; kt < kKTiles; ++kt) {
-        const int frag_base = ht_row_base + kt * kKTileStride + ng_offset;
+      if (ht < kHtiles) {
+        for (int kt = 0; kt < kKTiles; ++kt) {
+          const int frag_base = ht_row_base + kt * kKTileStride + ng_offset;
 
-        // Load A from h_lds (padded stride to avoid bank conflicts)
-        mmac_f16x4 a_regs;
-        {
-          const int k0 = kt * kMmacK;
-          const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
-          a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
-          a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
-        }
+          // Load A from h_lds (padded stride to avoid bank conflicts)
+          mmac_f16x4 a_regs;
+          {
+            const int k0 = kt * kMmacK;
+            const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
+            a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
+            a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
+          }
 
-        // Load B from packed layout — all 4 gates contiguous per K_row
-        mmac_f16x4 b_i, b_f, b_g, b_o;
-        b_i[0]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 0]);
-        b_i[1]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 1]);
-        b_i[2]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 2]);
-        b_i[3]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 3]);
-        b_f[0]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 0]);
-        b_f[1]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 1]);
-        b_f[2]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 2]);
-        b_f[3]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 3]);
-        b_g[0]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 0]);
-        b_g[1]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 1]);
-        b_g[2]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 2]);
-        b_g[3]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 3]);
-        b_o[0]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 0]);
-        b_o[1]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 1]);
-        b_o[2]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 2]);
-        b_o[3]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 3]);
+          // Load B from packed layout — all 4 gates contiguous per K_row
+          mmac_f16x4 b_i, b_f, b_g, b_o;
+          b_i[0]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 0]);
+          b_i[1]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 1]);
+          b_i[2]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 2]);
+          b_i[3]=(_Float16)half_to_float(packed_w[frag_base + 0*4 + 3]);
+          b_f[0]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 0]);
+          b_f[1]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 1]);
+          b_f[2]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 2]);
+          b_f[3]=(_Float16)half_to_float(packed_w[frag_base + 1*4 + 3]);
+          b_g[0]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 0]);
+          b_g[1]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 1]);
+          b_g[2]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 2]);
+          b_g[3]=(_Float16)half_to_float(packed_w[frag_base + 2*4 + 3]);
+          b_o[0]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 0]);
+          b_o[1]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 1]);
+          b_o[2]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 2]);
+          b_o[3]=(_Float16)half_to_float(packed_w[frag_base + 3*4 + 3]);
 
-        acc_i = mmac_f32_16x16x16f16_call(a_regs, b_i, acc_i);
-        acc_f = mmac_f32_16x16x16f16_call(a_regs, b_f, acc_f);
-        acc_g = mmac_f32_16x16x16f16_call(a_regs, b_g, acc_g);
-        acc_o = mmac_f32_16x16x16f16_call(a_regs, b_o, acc_o);
-      }  // K-tile
+          acc_i = mmac_f32_16x16x16f16_call(a_regs, b_i, acc_i);
+          acc_f = mmac_f32_16x16x16f16_call(a_regs, b_f, acc_f);
+          acc_g = mmac_f32_16x16x16f16_call(a_regs, b_g, acc_g);
+          acc_o = mmac_f32_16x16x16f16_call(a_regs, b_o, acc_o);
+        }  // K-tile
 
-      // Store accumulators to recur_h LDS (padded stride)
-      {
+        // Store accumulators to per-wave recur_h LDS scratch
         const int bl = lane_id & 15;
         const int gb = (lane_id >> 4) * 4;
-        recur_h[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
-        recur_h[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
-        recur_h[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
-        recur_h[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
-        recur_h[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
-        recur_h[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
-        recur_h[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
-        recur_h[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
-        recur_h[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
-        recur_h[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
-        recur_h[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
-        recur_h[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
-        recur_h[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
-        recur_h[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
-        recur_h[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
-        recur_h[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
+        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_wave[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_wave[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_wave[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_wave[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
       }
-
-      // Pointwise section (same as unpacked)
-      for (int i = tid; i < kBatchTile * kMmacK; i += 256) {
-        const int b_local = i / kMmacK, h_off = i - b_local * kMmacK;
-        const int b = b0 + b_local;
-        if (b >= batch_size) continue;
-        const int h = h0 + h_off;
-        const int gb2 = (b * seq_len + t) * kGateSize;
-
-        const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
-        const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
-        const float ri=recur_h[b_local*kRecurStride+h_off], rf=recur_h[b_local*kRecurStride+kMmacK+h_off];
-        const float rg=recur_h[b_local*kRecurStride+2*kMmacK+h_off], ro=recur_h[b_local*kRecurStride+3*kMmacK+h_off];
-
-        float ia = gi + ri, fa = gf + rf, ga = gg + rg, oa = go + ro;
-
-        if constexpr (Variant >= 1) {
-          const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
-          const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
-          ia += bi; fa += bf; ga += bg; oa += bo;
-        }
-
-        float ig = 0, fg = 0, gg2 = 0, og = 0;
-        if constexpr (Variant >= 2) {
-          ig = sigmoidf_fast(ia);
-          fg = sigmoidf_fast(fa);
-          gg2 = tanhf(ga);
-          og = sigmoidf_fast(oa);
-        }
-
-        if constexpr (Variant >= 3) {
-          const int ci = b_local * kHStride + h;
-          const float cp = cell_lds[ci];
-          const float cn = fg * cp + ig * gg2;
-          cell_lds[ci] = cn;
-          h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
-          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
-        } else {
-          h_next_lds[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
-          if (t == seq_len - 1) {
-            float v0, v1, v2, v3;
-            if constexpr (Variant == 0) {
-              v0 = gi + ri; v1 = gf + rf; v2 = gg + rg; v3 = go + ro;
-            } else if constexpr (Variant == 1) {
-              v0 = ia; v1 = fa; v2 = ga; v3 = oa;
-            } else {
-              v0 = ig; v1 = fg; v2 = gg2; v3 = og;
-            }
-            profile_out[b*kGateSize + 0*kH + h] = float_to_half(v0);
-            profile_out[b*kGateSize + 1*kH + h] = float_to_half(v1);
-            profile_out[b*kGateSize + 2*kH + h] = float_to_half(v2);
-            profile_out[b*kGateSize + 3*kH + h] = float_to_half(v3);
-          }
-        }
-      }  // pointwise
       __syncthreads();
-    }  // H-tile
+
+      // Pointwise for this wave's H tile
+      if (ht < kHtiles) {
+        for (int i = lane_id; i < kBatchTile * kMmacK; i += kWaveSize) {
+          const int b_local = i / kMmacK;
+          const int h_off = i - b_local * kMmacK;
+          const int b = b0 + b_local;
+          if (b >= batch_size) continue;
+          const int h = h0 + h_off;
+          const int gb2 = (b * seq_len + t) * kGateSize;
+
+          const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
+          const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
+          const float ri=recur_wave[b_local*kRecurStride+h_off], rf=recur_wave[b_local*kRecurStride+kMmacK+h_off];
+          const float rg=recur_wave[b_local*kRecurStride+2*kMmacK+h_off], ro=recur_wave[b_local*kRecurStride+3*kMmacK+h_off];
+
+          float ia = gi + ri, fa = gf + rf, ga = gg + rg, oa = go + ro;
+
+          if constexpr (Variant >= 1) {
+            const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
+            const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
+            ia += bi; fa += bf; ga += bg; oa += bo;
+          }
+
+          float ig = 0, fg = 0, gg2 = 0, og = 0;
+          if constexpr (Variant >= 2) {
+            ig = sigmoidf_fast(ia);
+            fg = sigmoidf_fast(fa);
+            gg2 = tanhf(ga);
+            og = sigmoidf_fast(oa);
+          }
+
+          if constexpr (Variant >= 3) {
+            const int ci = b_local * kHStride + h;
+            const float cp = cell_lds[ci];
+            const float cn = fg * cp + ig * gg2;
+            cell_lds[ci] = cn;
+            h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
+            if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
+          } else {
+            h_next_lds[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
+            if (t == seq_len - 1) {
+              float v0, v1, v2, v3;
+              if constexpr (Variant == 0) {
+                v0 = gi + ri; v1 = gf + rf; v2 = gg + rg; v3 = go + ro;
+              } else if constexpr (Variant == 1) {
+                v0 = ia; v1 = fa; v2 = ga; v3 = oa;
+              } else {
+                v0 = ig; v1 = fg; v2 = gg2; v3 = og;
+              }
+              profile_out[b*kGateSize + 0*kH + h] = float_to_half(v0);
+              profile_out[b*kGateSize + 1*kH + h] = float_to_half(v1);
+              profile_out[b*kGateSize + 2*kH + h] = float_to_half(v2);
+              profile_out[b*kGateSize + 3*kH + h] = float_to_half(v3);
+            }
+          }
+        }  // pointwise
+      }
+      __syncthreads();
+    }  // ht_group
 
     for (int i = tid; i < kBatchTile * kH; i += 256) {
       const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
