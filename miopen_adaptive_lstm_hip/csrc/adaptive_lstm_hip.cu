@@ -3807,7 +3807,6 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
           recur_wave[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
         }
       }
-      __syncthreads();
 
       // Pointwise for this wave's H tile
       if (ht < kHtiles) {
@@ -3866,8 +3865,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
           }
         }  // pointwise
       }
-      __syncthreads();
     }  // ht_group
+    __syncthreads();
 
     // Swap buffers: next timestep reads what we just wrote
     gpu_half* tmp = h_cur;
