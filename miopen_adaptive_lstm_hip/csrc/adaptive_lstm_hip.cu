@@ -3290,6 +3290,8 @@ adaptive_lstm_h128_mmac_persistent_kernel(
   constexpr int kHtiles = kH / kMmacK;
   constexpr int kGateRegions = 4;
   constexpr int kColsPerHTile = kMmacN * kGateRegions;
+  constexpr int kHStride = kH + 2;                  // pad to eliminate 16-way LDS bank conflict
+  constexpr int kRecurStride = kColsPerHTile + 2;   // pad for same reason
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
@@ -3297,12 +3299,12 @@ adaptive_lstm_h128_mmac_persistent_kernel(
   const int mmac_row = lane_id & 15;
   const int mmac_col0 = (lane_id >> 4) * 4;
 
-  __shared__ gpu_half h_lds[kBatchTile * kH];
-  __shared__ gpu_half h_next_lds[kBatchTile * kH];
-  __shared__ float cell_lds[kBatchTile * kH];
-  __shared__ float recur_h[kBatchTile * kColsPerHTile];
+  __shared__ gpu_half h_lds[kBatchTile * kHStride];
+  __shared__ gpu_half h_next_lds[kBatchTile * kHStride];
+  __shared__ float cell_lds[kBatchTile * kHStride];
+  __shared__ float recur_h[kBatchTile * kRecurStride];
 
-  for (int i = tid; i < kBatchTile * kH; i += 256) {
+  for (int i = tid; i < kBatchTile * kHStride; i += 256) {
     h_lds[i] = __float2half(0.0f);
     h_next_lds[i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
@@ -3322,16 +3324,16 @@ adaptive_lstm_h128_mmac_persistent_kernel(
       for (int kt = 0; kt < kKTiles; ++kt) {
         const int k0 = kt * kMmacK;
 
-        // Load A (h_lds tile) once per K-tile
+        // Load A (h_lds tile) once per K-tile — serves all 4 gates
         mmac_f16x4 a_regs;
         {
-          const gpu_half* sa = h_lds + mmac_row * kH + k0 + mmac_col0;
+          const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
           a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
           a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
         }
         const int w_row = k0 + mmac_row;
 
-        // Gate i: load B, run MMAC
+        // Gate i
         {
           mmac_f16x4 b_regs;
           const int gc = 0*kH + h0;
@@ -3373,29 +3375,29 @@ adaptive_lstm_h128_mmac_persistent_kernel(
         }
       }  // k-tile
 
-      // Store accumulators to LDS for gate math (same layout as before)
+      // Store accumulators to recur_h LDS
       {
         const int bl = lane_id & 15;
         const int gb = (lane_id >> 4) * 4;
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+0] = acc_i[0];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+1] = acc_i[1];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+2] = acc_i[2];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+3] = acc_i[3];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+0] = acc_f[0];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+1] = acc_f[1];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+2] = acc_f[2];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+3] = acc_f[3];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+0] = acc_g[0];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+1] = acc_g[1];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+2] = acc_g[2];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+3] = acc_g[3];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+0] = acc_o[0];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+1] = acc_o[1];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+2] = acc_o[2];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+3] = acc_o[3];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
       }
 
-      // Gate math (unchanged — reads from recur_h LDS)
+      // Gate math — reads gate_proj, bias, recur_h
       for (int i = tid; i < kBatchTile * kMmacK; i += 256) {
         const int b_local = i / kMmacK, h_off = i - b_local * kMmacK;
         const int b = b0 + b_local;
@@ -3404,33 +3406,37 @@ adaptive_lstm_h128_mmac_persistent_kernel(
         const int gb2 = (b * seq_len + t) * kGateSize;
         const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
         const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
-        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMmacK+h_off];
-        const float rg=recur_h[b_local*kColsPerHTile+2*kMmacK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMmacK+h_off];
+        const float ri=recur_h[b_local*kRecurStride+h_off], rf=recur_h[b_local*kRecurStride+kMmacK+h_off];
+        const float rg=recur_h[b_local*kRecurStride+2*kMmacK+h_off], ro=recur_h[b_local*kRecurStride+3*kMmacK+h_off];
         const float bi=half_to_float(bias[h]), bf=half_to_float(bias[h+kH]);
         const float bg=half_to_float(bias[h+2*kH]), bo=half_to_float(bias[h+3*kH]);
         const float ia=gi+ri+bi, fa=gf+rf+bf, ga=gg+rg+bg, oa=go+ro+bo;
         const float ig=sigmoidf_fast(ia), fg=sigmoidf_fast(fa);
         const float gg2=tanhf(ga), og=sigmoidf_fast(oa);
-        const int ci = b_local * kH + h;
+        const int ci = b_local * kHStride + h;
         const float cp = cell_lds[ci];
         const float cn = fg * cp + ig * gg2;
         cell_lds[ci] = cn;
-        h_next_lds[b_local*kH+h] = float_to_half(og * tanhf(cn));
-        if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kH+h];
+        h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
+        if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
       }
       __syncthreads();
     }
 
-    for (int i = tid; i < kBatchTile * kH; i += 256)
-      h_lds[i] = h_next_lds[i];
+    for (int i = tid; i < kBatchTile * kH; i += 256) {
+      const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
+      if (b < batch_size) {
+        h_lds[b_local*kHStride+h] = h_next_lds[b_local*kHStride+h];
+      }
+    }
     __syncthreads();
   }
 
   for (int i = tid; i < kBatchTile * kH; i += 256) {
     const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
     if (b < batch_size) {
-      h_state_io[b*kH+h] = h_lds[i];
-      c_state_io[b*kH+h] = cell_lds[i];
+      h_state_io[b*kH+h] = h_lds[b_local*kHStride+h];
+      c_state_io[b*kH+h] = cell_lds[b_local*kHStride+h];
     }
   }
 }
@@ -3463,6 +3469,8 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
   constexpr int kHtiles = kH / kMmacK;
   constexpr int kGateRegions = 4;
   constexpr int kColsPerHTile = kMmacN * kGateRegions;
+  constexpr int kHStride = kH + 2;                  // pad to eliminate 16-way LDS bank conflict
+  constexpr int kRecurStride = kColsPerHTile + 2;   // pad for same reason
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
@@ -3470,12 +3478,12 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
   const int mmac_row = lane_id & 15;
   const int mmac_col0 = (lane_id >> 4) * 4;
 
-  __shared__ gpu_half h_lds[kBatchTile * kH];
-  __shared__ gpu_half h_next_lds[kBatchTile * kH];
-  __shared__ float cell_lds[kBatchTile * kH];
-  __shared__ float recur_h[kBatchTile * kColsPerHTile];
+  __shared__ gpu_half h_lds[kBatchTile * kHStride];
+  __shared__ gpu_half h_next_lds[kBatchTile * kHStride];
+  __shared__ float cell_lds[kBatchTile * kHStride];
+  __shared__ float recur_h[kBatchTile * kRecurStride];
 
-  for (int i = tid; i < kBatchTile * kH; i += 256) {
+  for (int i = tid; i < kBatchTile * kHStride; i += 256) {
     h_lds[i] = __float2half(0.0f);
     h_next_lds[i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
@@ -3497,7 +3505,7 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
 
         mmac_f16x4 a_regs;
         {
-          const gpu_half* sa = h_lds + mmac_row * kH + k0 + mmac_col0;
+          const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
           a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
           a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
         }
@@ -3549,22 +3557,22 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
       {
         const int bl = lane_id & 15;
         const int gb = (lane_id >> 4) * 4;
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+0] = acc_i[0];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+1] = acc_i[1];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+2] = acc_i[2];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+3] = acc_i[3];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+0] = acc_f[0];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+1] = acc_f[1];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+2] = acc_f[2];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+3] = acc_f[3];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+0] = acc_g[0];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+1] = acc_g[1];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+2] = acc_g[2];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+3] = acc_g[3];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+0] = acc_o[0];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+1] = acc_o[1];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+2] = acc_o[2];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+3] = acc_o[3];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
       }
 
       // ---- Pointwise section (varies by variant) ----
@@ -3577,8 +3585,8 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
 
         const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
         const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
-        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMmacK+h_off];
-        const float rg=recur_h[b_local*kColsPerHTile+2*kMmacK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMmacK+h_off];
+        const float ri=recur_h[b_local*kRecurStride+h_off], rf=recur_h[b_local*kRecurStride+kMmacK+h_off];
+        const float rg=recur_h[b_local*kRecurStride+2*kMmacK+h_off], ro=recur_h[b_local*kRecurStride+3*kMmacK+h_off];
 
         float ia = gi + ri, fa = gf + rf, ga = gg + rg, oa = go + ro;
 
@@ -3597,16 +3605,16 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
         }
 
         if constexpr (Variant >= 3) {
-          const int ci = b_local * kH + h;
+          const int ci = b_local * kHStride + h;
           const float cp = cell_lds[ci];
           const float cn = fg * cp + ig * gg2;
           cell_lds[ci] = cn;
-          h_next_lds[b_local*kH+h] = float_to_half(og * tanhf(cn));
-          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kH+h];
+          h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
+          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
         } else {
           // Variants 0-2: use sigmoid(gate_i) as fake next hidden state
           // to maintain non-zero, evolving input for MMAC across timesteps
-          h_next_lds[b_local*kH+h] = float_to_half(sigmoidf_fast(ia));
+          h_next_lds[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
 
           // Write intermediate results to profile_out at last timestep
           if (t == seq_len - 1) {
@@ -3628,8 +3636,12 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
       __syncthreads();
     }  // H-tile
 
-    for (int i = tid; i < kBatchTile * kH; i += 256)
-      h_lds[i] = h_next_lds[i];
+    for (int i = tid; i < kBatchTile * kH; i += 256) {
+      const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
+      if (b < batch_size) {
+        h_lds[b_local*kHStride+h] = h_next_lds[b_local*kHStride+h];
+      }
+    }
     __syncthreads();
   }  // timestep
 
@@ -3637,12 +3649,14 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
     for (int i = tid; i < kBatchTile * kH; i += 256) {
       const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
       if (b < batch_size) {
-        h_state_io[b*kH+h] = h_lds[i];
-        c_state_io[b*kH+h] = cell_lds[i];
+        h_state_io[b*kH+h] = h_lds[b_local*kHStride+h];
+        c_state_io[b*kH+h] = cell_lds[b_local*kHStride+h];
       }
     }
   }
 }
+
+
 
 
 // Packed-weight variant kernel — B-load from pre-packed [65536] layout
@@ -3670,6 +3684,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   constexpr int kHtiles = kH / kMmacK;
   constexpr int kGateRegions = 4;
   constexpr int kColsPerHTile = kMmacN * kGateRegions;
+  constexpr int kHStride = kH + 2;
+  constexpr int kRecurStride = kColsPerHTile + 2;
 
   constexpr int kRowStride = 64;           // 4 gates × 16 N
   constexpr int kKTileStride = kMmacK * kRowStride;   // 1024
@@ -3681,12 +3697,12 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   const int mmac_row = lane_id & 15;
   const int mmac_col0 = (lane_id >> 4) * 4;
 
-  __shared__ gpu_half h_lds[kBatchTile * kH];
-  __shared__ gpu_half h_next_lds[kBatchTile * kH];
-  __shared__ float cell_lds[kBatchTile * kH];
-  __shared__ float recur_h[kBatchTile * kColsPerHTile];
+  __shared__ gpu_half h_lds[kBatchTile * kHStride];
+  __shared__ gpu_half h_next_lds[kBatchTile * kHStride];
+  __shared__ float cell_lds[kBatchTile * kHStride];
+  __shared__ float recur_h[kBatchTile * kRecurStride];
 
-  for (int i = tid; i < kBatchTile * kH; i += 256) {
+  for (int i = tid; i < kBatchTile * kHStride; i += 256) {
     h_lds[i] = __float2half(0.0f);
     h_next_lds[i] = __float2half(0.0f);
     cell_lds[i] = 0.0f;
@@ -3708,11 +3724,11 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
       for (int kt = 0; kt < kKTiles; ++kt) {
         const int frag_base = ht_row_base + kt * kKTileStride + ng_offset;
 
-        // Load A from h_lds (same as unpacked)
+        // Load A from h_lds (padded stride to avoid bank conflicts)
         mmac_f16x4 a_regs;
         {
           const int k0 = kt * kMmacK;
-          const gpu_half* sa = h_lds + mmac_row * kH + k0 + mmac_col0;
+          const gpu_half* sa = h_lds + mmac_row * kHStride + k0 + mmac_col0;
           a_regs[0]=(_Float16)half_to_float(sa[0]); a_regs[1]=(_Float16)half_to_float(sa[1]);
           a_regs[2]=(_Float16)half_to_float(sa[2]); a_regs[3]=(_Float16)half_to_float(sa[3]);
         }
@@ -3742,26 +3758,26 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
         acc_o = mmac_f32_16x16x16f16_call(a_regs, b_o, acc_o);
       }  // K-tile
 
-      // Store accumulators to recur_h LDS (same as unpacked)
+      // Store accumulators to recur_h LDS (padded stride)
       {
         const int bl = lane_id & 15;
         const int gb = (lane_id >> 4) * 4;
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+0] = acc_i[0];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+1] = acc_i[1];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+2] = acc_i[2];
-        recur_h[bl*kColsPerHTile+ 0*kMmacN+gb+3] = acc_i[3];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+0] = acc_f[0];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+1] = acc_f[1];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+2] = acc_f[2];
-        recur_h[bl*kColsPerHTile+ 1*kMmacN+gb+3] = acc_f[3];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+0] = acc_g[0];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+1] = acc_g[1];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+2] = acc_g[2];
-        recur_h[bl*kColsPerHTile+ 2*kMmacN+gb+3] = acc_g[3];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+0] = acc_o[0];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+1] = acc_o[1];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+2] = acc_o[2];
-        recur_h[bl*kColsPerHTile+ 3*kMmacN+gb+3] = acc_o[3];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+0] = acc_i[0];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+1] = acc_i[1];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+2] = acc_i[2];
+        recur_h[bl*kRecurStride+ 0*kMmacN+gb+3] = acc_i[3];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+0] = acc_f[0];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+1] = acc_f[1];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+2] = acc_f[2];
+        recur_h[bl*kRecurStride+ 1*kMmacN+gb+3] = acc_f[3];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+0] = acc_g[0];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+1] = acc_g[1];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+2] = acc_g[2];
+        recur_h[bl*kRecurStride+ 2*kMmacN+gb+3] = acc_g[3];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+0] = acc_o[0];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+1] = acc_o[1];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+2] = acc_o[2];
+        recur_h[bl*kRecurStride+ 3*kMmacN+gb+3] = acc_o[3];
       }
 
       // Pointwise section (same as unpacked)
@@ -3774,8 +3790,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
 
         const float gi=half_to_float(gate_proj[gb2+h]), gf=half_to_float(gate_proj[gb2+h+kH]);
         const float gg=half_to_float(gate_proj[gb2+h+2*kH]), go=half_to_float(gate_proj[gb2+h+3*kH]);
-        const float ri=recur_h[b_local*kColsPerHTile+h_off], rf=recur_h[b_local*kColsPerHTile+kMmacK+h_off];
-        const float rg=recur_h[b_local*kColsPerHTile+2*kMmacK+h_off], ro=recur_h[b_local*kColsPerHTile+3*kMmacK+h_off];
+        const float ri=recur_h[b_local*kRecurStride+h_off], rf=recur_h[b_local*kRecurStride+kMmacK+h_off];
+        const float rg=recur_h[b_local*kRecurStride+2*kMmacK+h_off], ro=recur_h[b_local*kRecurStride+3*kMmacK+h_off];
 
         float ia = gi + ri, fa = gf + rf, ga = gg + rg, oa = go + ro;
 
@@ -3794,14 +3810,14 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
         }
 
         if constexpr (Variant >= 3) {
-          const int ci = b_local * kH + h;
+          const int ci = b_local * kHStride + h;
           const float cp = cell_lds[ci];
           const float cn = fg * cp + ig * gg2;
           cell_lds[ci] = cn;
-          h_next_lds[b_local*kH+h] = float_to_half(og * tanhf(cn));
-          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kH+h];
+          h_next_lds[b_local*kHStride+h] = float_to_half(og * tanhf(cn));
+          if (WriteSequence) out[(b*seq_len+t)*kH+h] = h_next_lds[b_local*kHStride+h];
         } else {
-          h_next_lds[b_local*kH+h] = float_to_half(sigmoidf_fast(ia));
+          h_next_lds[b_local*kHStride+h] = float_to_half(sigmoidf_fast(ia));
           if (t == seq_len - 1) {
             float v0, v1, v2, v3;
             if constexpr (Variant == 0) {
@@ -3821,8 +3837,12 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
       __syncthreads();
     }  // H-tile
 
-    for (int i = tid; i < kBatchTile * kH; i += 256)
-      h_lds[i] = h_next_lds[i];
+    for (int i = tid; i < kBatchTile * kH; i += 256) {
+      const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
+      if (b < batch_size) {
+        h_lds[b_local*kHStride+h] = h_next_lds[b_local*kHStride+h];
+      }
+    }
     __syncthreads();
   }  // timestep
 
@@ -3830,8 +3850,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
     for (int i = tid; i < kBatchTile * kH; i += 256) {
       const int b_local = i / kH, h = i - b_local * kH, b = b0 + b_local;
       if (b < batch_size) {
-        h_state_io[b*kH+h] = h_lds[i];
-        c_state_io[b*kH+h] = cell_lds[i];
+        h_state_io[b*kH+h] = h_lds[b_local*kHStride+h];
+        c_state_io[b*kH+h] = cell_lds[b_local*kHStride+h];
       }
     }
   }
