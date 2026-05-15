@@ -98,9 +98,10 @@ def _use_h128_cached_path(ext, hidden_size: int) -> bool:
 
 
 def _recurrent_backend(ext, hidden_size: int) -> str:
-    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND", "gemm_scan").strip().lower()
+    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND", "auto").strip().lower()
     if raw in {"", "auto", "best"}:
-        raw = "gemm_scan"
+        # H<=128: persistent_mmac packed (4.48s), H>128: gemm_scan
+        raw = "persistent_mmac" if hidden_size <= 128 else "gemm_scan"
     if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mmac"}:
         raise ValueError(
             "MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND must be auto, seqmajor_accum, gemm_scan, cached, partitioned, scalar, persistent_mmac"
