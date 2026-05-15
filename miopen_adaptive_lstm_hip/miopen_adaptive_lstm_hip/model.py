@@ -101,9 +101,9 @@ def _recurrent_backend(ext, hidden_size: int) -> str:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND", "gemm_scan").strip().lower()
     if raw in {"", "auto", "best"}:
         raw = "gemm_scan"
-    if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mmac", "profile_variants"}:
+    if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mmac"}:
         raise ValueError(
-            "MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND must be auto, seqmajor_accum, gemm_scan, cached, partitioned, scalar, persistent_mmac, or profile_variants"
+            "MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND must be auto, seqmajor_accum, gemm_scan, cached, partitioned, scalar, persistent_mmac"
         )
     if (
         raw == "seqmajor_accum"
@@ -117,11 +117,6 @@ def _recurrent_backend(ext, hidden_size: int) -> str:
         h128_fn = "adaptive_lstm_h128_persistent_mmac_update_forward_workspace"
         if not (hidden_size == 128 and hasattr(ext, h128_fn)) and not hasattr(ext, packed_fn):
             return "gemm_scan"
-    if (
-        raw == "profile_variants"
-        and not (hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_mmac_profile_variant_forward_workspace"))
-    ):
-        return "gemm_scan"
     return raw
 
 
@@ -244,27 +239,6 @@ def _use_fixed_hidden_scan() -> bool:
     if raw not in {"", "1", "true", "yes", "on", "auto"}:
         raise ValueError("MIOPEN_ADAPTIVE_LSTM_FIXED_HIDDEN_SCAN must be 1, 0, or auto")
     return True
-
-
-def _profile_variant() -> int:
-    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_PROFILE_VARIANT", "3").strip().lower()
-    if raw in {"0", "a"}:
-        return 0
-    if raw in {"1", "b"}:
-        return 1
-    if raw in {"2", "c"}:
-        return 2
-    if raw in {"3", "d", "full"}:
-        return 3
-    try:
-        v = int(raw)
-        if 0 <= v <= 3:
-            return v
-    except ValueError:
-        pass
-    raise ValueError("MIOPEN_ADAPTIVE_LSTM_PROFILE_VARIANT must be 0, 1, 2, 3, a, b, c, d, or full")
-
-
 
 
 def _use_packed_mmac(ext, hidden_size: int) -> bool:
@@ -663,7 +637,7 @@ class AdaptiveLSTMRegressor(nn.Module):
                     and hasattr(ext, "adaptive_lstm_h128_seqmajor_accum_update_forward")
                 )
                 use_h128_gemm_scan_workspace = (
-                    backend in {"gemm_scan", "persistent_mmac", "profile_variants"}
+                    backend in {"gemm_scan", "persistent_mmac"}
                     and hidden_size == 128
                     and (
                         hasattr(ext, "adaptive_lstm_h128_gemm_scan_update_forward")
@@ -851,53 +825,6 @@ class AdaptiveLSTMRegressor(nn.Module):
                             )
                             actual_kernel_name = f"{prefix}_persistent_mmac"
                             actual_pipeline_name = "persistent_mmac"
-                    layer_input_is_seqmajor = False
-                elif (
-                    backend == "profile_variants"
-                    and hidden_size == 128
-                    and hasattr(ext, "adaptive_lstm_h128_mmac_profile_variant_forward_workspace")
-                ):
-                    variant = _profile_variant()
-                    variant_names = {0: "mmac_only", 1: "mmac_bias", 2: "mmac_act", 3: "mmac_full"}
-                    actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
-                        plan.hidden_launch.read_block, hidden_size
-                    )
-                    if workspace is not None:
-                        out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
-                        layer_input = ext.adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
-                            gate,
-                            args.weight_hh,
-                            args.bias,
-                            workspace.h_state,
-                            workspace.c_state,
-                            out_workspace,
-                            workspace.recur,
-                            not is_last,
-                            actual_gemm_scan_read_block,
-                            variant,
-                        )
-                        actual_gemm_scan_workspace = True
-                    else:
-                        _h_state = torch.zeros((batch_size, hidden_size), device=gate.device, dtype=gate.dtype)
-                        _c_state = torch.zeros((batch_size, hidden_size), device=gate.device, dtype=torch.float32)
-                        _out = torch.empty(
-                            (batch_size, seq_len, hidden_size) if not is_last else (batch_size, hidden_size),
-                            device=gate.device, dtype=gate.dtype)
-                        _pout = torch.empty((batch_size, 512), device=gate.device, dtype=gate.dtype)
-                        layer_input = ext.adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
-                            gate,
-                            args.weight_hh,
-                            args.bias,
-                            _h_state,
-                            _c_state,
-                            _out,
-                            _pout,
-                            not is_last,
-                            actual_gemm_scan_read_block,
-                            variant,
-                        )
-                    actual_kernel_name = f"h128_profile_v{variant}_{variant_names.get(variant, '?')}"
-                    actual_pipeline_name = "profile_variants"
                     layer_input_is_seqmajor = False
                 elif backend == "gemm_scan" and hidden_size == 128 and hasattr(ext, "adaptive_lstm_h128_gemm_scan_update_forward"):
                     actual_gemm_scan_read_block = _valid_gemm_scan_read_block(
