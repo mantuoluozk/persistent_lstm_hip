@@ -175,7 +175,7 @@ def _use_direct_blas() -> bool:
 
 
 def _recurrent_compute_mode() -> str:
-    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE", "fp32").strip().lower()
+    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE", "fp16").strip().lower()
     if raw in {"", "fp32", "32", "float"}:
         return "fp32"
     if raw in {"fp16", "16", "half"}:
