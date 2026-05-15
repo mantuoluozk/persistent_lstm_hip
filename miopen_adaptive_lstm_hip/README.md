@@ -108,10 +108,10 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 | 路径 | H128 | H256 | H512 | 说明 |
 |------|------|------|------|------|
-| 原生 PyTorch | 7.63s | 11.03s | 21.67s | MIOpen 基线 |
-| **Packed MMAC** | **4.48s** | 15.95s | 50.60s | B=4, grid=128, wave_id |
-| gemm_scan | 6.84s | **9.12s** | **41.24s** | rocBLAS GEMM |
-| 最优 | **MMAC -41%** | gemm_scan | gemm_scan | |
+| 原生 PyTorch | 7.63s | 11.03s | 21.67s (15.91s b256) | MIOpen 基线 |
+| **Packed MMAC** | **4.48s** | 15.95s | 50.60s (41.91s b256) | B=4, grid=128, wave_id |
+| gemm_scan | 6.84s | **9.12s** | **41.24s (12.55s b256)** | rocBLAS GEMM |
+| 最优 | **MMAC -41%** | gemm_scan | gemm_scan (b256) | |
 
 ### 优化历程
 
