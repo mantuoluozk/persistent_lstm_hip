@@ -108,8 +108,12 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 | 路径 | 耗时 | 吞吐 | 说明 |
 |------|------|------|------|
-| **persistent_mmac packed (P2 sync-opt)** | **4.40s** | **11627 samples/s** | **syncthreads 2→1/timestep，最优** |
-| persistent_mmac packed (P1 double-buf) | 4.68s | 10932 samples/s | 双缓冲 h_state |
+| **H128 packed MMAC** | **4.48s** | **11429 samples/s** | **B=4, grid=128, 反超 gemm_scan 25%** |
+| H128 gemm_scan | 5.96s | 8590 samples/s | rocBLAS GEMM tensor core |
+| H256 packed MMAC | 15.93s | 3214 samples/s | B=4, grid=128 |
+| H256 gemm_scan | 9.12s | 5614 samples/s | rocBLAS 大矩阵更优 |
+| H512 packed MMAC | 50.56s | 1013 samples/s | B=4, grid=128 |
+| H512 gemm_scan | 41.10s | 1246 samples/s | rocBLAS 大矩阵更优 |
 | persistent_mmac packed (split-B B=4) | 4.79s | 10686 samples/s | batch_tile=4, grid=128 |
 | persistent_mmac packed (split-B B=8) | 5.63s | 9094 samples/s | batch_tile=8, grid=64 |
 | gemm_scan（默认） | ~7.4s | ~6900 samples/s | rocBLAS GEMM tensor core |
