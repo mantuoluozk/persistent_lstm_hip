@@ -106,14 +106,12 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 默认 shape：`input=5, hidden=128, layers=4, output=24, seq_len=1000, batch=512`（100 次迭代）
 
-| 路径 | 耗时 | 说明 |
-|------|------|------|
-| **H128 packed MMAC** | **4.48s** | B=4, grid=128, 反超 gemm_scan 25% |
-| H128 gemm_scan | 5.96s | rocBLAS GEMM（默认 H>128） |
-| H256 packed MMAC | 15.93s | 实验性，rocBLAS 更优 |
-| H256 gemm_scan | 9.12s | 大矩阵 tensor core 占优 |
-| H512 packed MMAC | 50.56s | 实验性 |
-| H512 gemm_scan | 41.10s | 大矩阵 tensor core 占优 |
+| 路径 | H128 | H256 | H512 | 说明 |
+|------|------|------|------|------|
+| 原生 PyTorch | 7.63s | 11.03s | 21.67s | MIOpen 基线 |
+| **Packed MMAC** | **4.48s** | 15.95s | 50.60s | B=4, grid=128, wave_id |
+| gemm_scan | 6.84s | **9.12s** | **41.24s** | rocBLAS GEMM |
+| 最优 | **MMAC -41%** | gemm_scan | gemm_scan | |
 
 ### 优化历程
 
