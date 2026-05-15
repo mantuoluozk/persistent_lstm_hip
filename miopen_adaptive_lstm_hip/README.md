@@ -34,8 +34,9 @@ for each timestep:
 
 | 后端 | 激活方式 | 适用 hidden_size | 说明 |
 |------|---------|-----------------|------|
-| `gemm_scan` | 默认 | 全部 | rocBLAS GEMM + HIP pointwise，H>128 最优 |
-| `persistent_mmac` | `_BACKEND=persistent_mmac` | 全部 | 持久化 kernel，H≤128 用 packed MMAC (4.48s)，H>128 可实验 |
+| `gemm_scan` | H>128 默认 | 全部 | rocBLAS GEMM + HIP pointwise |
+| `persistent_mmac` | **H≤128 默认** | 全部 | 持久化 kernel + packed MMAC，H128 上 4.48s 最优 |
+| `persistent_mmac` | `_BACKEND=persistent_mmac` | 全部 | 持久化 kernel + packed MMAC（默认自动选择） |
 | `seqmajor_accum` | `_BACKEND=seqmajor_accum` | H128 | MIOpen 风格 seq-major 门控累加 |
 | `cached` | `_BACKEND=cached` | H128 | 权重缓存标量 kernel（B2/B4/B8 自适应） |
 | `partitioned` | `_BACKEND=partitioned` | 全部 | 分区标量点积（P4/P8 自适应） |
@@ -62,7 +63,7 @@ HCU MMAC：`__builtin_hcu_mmac_f32_16x16x16_f16`，64 线程 lane mapping `row=l
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND` | `gemm_scan` | 后端选择 |
+| `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND` | `auto` | 后端选择（auto = H≤128→MMAC, H>128→gemm_scan） |
 | `MIOPEN_ADAPTIVE_LSTM_USE_MMAC` | `1` | persistent_mmac 是否启用 MMAC（0=标量） |
 | `MIOPEN_ADAPTIVE_LSTM_MMAC_PACKED` | `1` | MMAC 是否使用 packed weight |
 | `MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE` | `fp32` | 循环 GEMM 精度：`fp32`/`fp16`/`auto_fast`/`auto_aggressive` |
@@ -78,17 +79,14 @@ HCU MMAC：`__builtin_hcu_mmac_f32_16x16x16_f16`，64 线程 lane mapping `row=l
 # 编译
 python setup.py build_ext --inplace
 
-# 默认（gemm_scan，全尺寸）
+# 默认 auto（自动选最优：H128→MMAC 4.48s, H>128→gemm_scan）
 python run_adaptive_lstm.py
 
-# H128 最优路径（packed MMAC，4.48s）
-MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mmac \
-MIOPEN_ADAPTIVE_LSTM_USE_MMAC=1 \
-MIOPEN_ADAPTIVE_LSTM_MMAC_PACKED=1 \
-python run_adaptive_lstm.py
-
-# H256/H512
+# H256/H512（自动走 gemm_scan）
 MIOPEN_ADAPTIVE_HIDDEN=256 python run_adaptive_lstm.py
+
+# 手动覆盖后端
+MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mmac python run_adaptive_lstm.py
 
 # 调试输出
 MIOPEN_ADAPTIVE_LSTM_DEBUG=1 python run_adaptive_lstm.py
@@ -232,5 +230,5 @@ miopen_adaptive_lstm_hip/
 - ☐ H256/H512 MMAC 性能优化（hidden tile 并行拆分）
 - ☐ 线性头融合
 - ☐ 4 层融合 kernel
-- ☐ Shape-aware 自动后端选择
+- ✅ Shape-aware 自动后端选择（H≤128→MMAC, H>128→gemm_scan）
 - ☐ BF16/FP32、训练模式
