@@ -134,6 +134,7 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | Reduce syncthreads | 4.40s | 7.44s | syncthreads 2→1/timestep，省 per-timestep barrier (-6.0%) |
 | Batch-tile sweep | B=4 最优 | — | B=16(7.5s)→8(5.6s)→4(4.4s)→2(6.8s)→1(12.7s) |
 | LDS B-tile staging | 8.36s | 4.40s | LDS write+read 不省 global load，额外开销 90%（已回退） |
+| **Multi-size (H256/H512)** | **H128:4.4s H256:36ms H512:117ms** | — | **参数化模板 HiddenSize，自动适配 H128/256/512** |
 
 ## 优化参考：可借鉴技术
 
@@ -223,7 +224,9 @@ miopen_adaptive_lstm_hip/
 2. ✅ Wavefront 重复计算修复：wave_id 分配 4 波前并行处理 4 个 H-tile，2.3x 加速
 3. ✅ LDS bank conflict 修复：padding stride 消除 16-way conflict
 4. ✅ Weight pre-packing：packed [htile][ktile][krow][ngroup][gate][frag] 布局
-5. ✅ Split-B (batch_tile=4)：grid=128，MMAC 4.79s 反超 gemm_scan 35%，累计 30x 加速
+5. ✅ Split-B (batch_tile=4)：grid=128，MMAC 4.79s 反超 gemm_scan 35%
+6. ✅ 双缓冲 h_state + 减少 syncthreads：4.40s
+7. ✅ Multi-size 参数化：H256 (36ms/layer) / H512 (117ms/layer)
 2. MFMA kernel 进一步优化：
    - 权重跨 timestep 驻留（需解决 K-tile 外移同步开销）
    - 隐藏单元并行
