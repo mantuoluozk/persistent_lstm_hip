@@ -3674,14 +3674,14 @@ adaptive_lstm_h128_mmac_profile_variant_kernel(
 
 
 
-// Packed-weight variant kernel — B-load from pre-packed [65536] layout
-// Layout: [htile=8][ktile=8][K=16][gate=4][N_group=4][frag=4]
+// Packed-weight variant kernel — generic over HiddenSize (128/256/512)
+// Layout: [htile][ktile][K=16][gate=4][N_group=4][frag=4]
 // Per K_row: 4 gates × 4 N_groups × 4 frag = 64 halfs, contiguous
-template <bool WriteSequence, int Variant>
+template <bool WriteSequence, int Variant, int HiddenSize>
 __global__ void __launch_bounds__(256)
-adaptive_lstm_h128_mmac_packed_variant_kernel(
-    const gpu_half* __restrict__ gate_proj,  // [B, T, 512]
-    const gpu_half* __restrict__ packed_w,   // [65536] packed layout
+adaptive_lstm_mmac_packed_kernel(
+    const gpu_half* __restrict__ gate_proj,  // [B, T, 4*kH]
+    const gpu_half* __restrict__ packed_w,   // [kH*kH*4] packed layout
     const gpu_half* __restrict__ bias,
     gpu_half* __restrict__ h_state_io,
     float* __restrict__ c_state_io,
@@ -3690,8 +3690,8 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
     int batch_size,
     int seq_len) {
 
-  constexpr int kH = 128;
-  constexpr int kGateSize = 512;
+  constexpr int kH = HiddenSize;
+  constexpr int kGateSize = 4 * kH;
   constexpr int kMmacM = 16;               // MMAC M dimension (hardware)
   constexpr int kBatchTile = 4;            // logical batch per block (split-B)
   constexpr int kMmacK = 16;
@@ -3707,7 +3707,7 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
 
   constexpr int kRowStride = 64;           // 4 gates × 16 N
   constexpr int kKTileStride = kMmacK * kRowStride;   // 1024
-  constexpr int kHTileStride = kKTiles * kKTileStride; // 8192
+  constexpr int kHTileStride = kKTiles * kKTileStride; // kTiles * 1024
 
   const int b0 = blockIdx.x * kBatchTile;
   const int tid = threadIdx.x;
@@ -3717,17 +3717,17 @@ adaptive_lstm_h128_mmac_packed_variant_kernel(
   const int mmac_col0 = (lane_id >> 4) * 4;
   const bool row_active = mmac_row < kBatchTile;
 
-  // LDS rows sized for MMAC M=16; only first kBatchTile rows are valid
-  // Double-buffered h_state: h_cur for A-load, h_next for pointwise write
+  // h_buf: full 16 MMAC rows needed for A-load; cell_lds: only kBatchTile active rows
   __shared__ gpu_half h_buf[2][kMmacM * kHStride];
-  __shared__ float cell_lds[kMmacM * kHStride];
+  __shared__ float cell_lds[kBatchTile * kHStride];
   __shared__ float recur_h[kWavesPerBlock * kBatchTile * kRecurStride];
 
   for (int i = tid; i < kMmacM * kHStride; i += 256) {
     h_buf[0][i] = __float2half(0.0f);
     h_buf[1][i] = __float2half(0.0f);
-    cell_lds[i] = 0.0f;
   }
+  for (int i = tid; i < kBatchTile * kHStride; i += 256)
+    cell_lds[i] = 0.0f;
   __syncthreads();
 
   gpu_half* h_cur = h_buf[0];
@@ -4090,8 +4090,10 @@ torch::Tensor adaptive_lstm_h128_mmac_profile_variant_forward_workspace(
 }
 
 
-// Wrapper for packed-weight profile variants — B-load from pre-packed [65536] layout
-torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
+// Packed-weight wrapper — generic over hidden_size (128/256/512)
+// Validates tensor shapes against expected hidden_size, launches templated kernel.
+template <int HiddenSize>
+static torch::Tensor launch_packed_mmac(
     const torch::Tensor& gate_proj,
     const torch::Tensor& packed_weight,
     const torch::Tensor& bias,
@@ -4111,12 +4113,15 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
 
   const int batch_size = static_cast<int>(gate.size(0));
   const int seq_len = static_cast<int>(gate.size(1));
+  constexpr int kH = HiddenSize;
+  constexpr int kGateSize = 4 * kH;
+  constexpr int kPackedSize = kH * kH * 4;
 
-  if (gate.size(2) != 512 || pkw.size(0) != 65536 ||
-      b.size(0) != 512 || h_state.size(0) != batch_size || h_state.size(1) != 128 ||
-      c_state.size(0) != batch_size || c_state.size(1) != 128 ||
-      pout.size(0) != batch_size || pout.size(1) != 512) {
-    throw std::invalid_argument("adaptive H128 packed variant kernel received incompatible shapes");
+  if (gate.size(2) != kGateSize || pkw.size(0) != kPackedSize ||
+      b.size(0) != kGateSize || h_state.size(0) != batch_size || h_state.size(1) != kH ||
+      c_state.size(0) != batch_size || c_state.size(1) != kH ||
+      pout.size(0) != batch_size || pout.size(1) != kGateSize) {
+    throw std::invalid_argument("adaptive packed MMAC kernel received incompatible shapes");
   }
 
   (void)read_block;
@@ -4128,7 +4133,7 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
 
 #define LAUNCH_PACKED_VARIANT(V, WS) \
   GPU_LAUNCH_KERNEL( \
-      (adaptive_lstm_h128_mmac_packed_variant_kernel<WS, V>), \
+      (adaptive_lstm_mmac_packed_kernel<WS, V, HiddenSize>), \
       grid, 256, 0, 0, \
       reinterpret_cast<const gpu_half*>(gate.data_ptr<at::Half>()), \
       reinterpret_cast<const gpu_half*>(pkw.data_ptr<at::Half>()), \
@@ -4153,12 +4158,32 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
 
   check_last_error();
 #else
+  (void)variant; (void)write_sequence;
   throw std::runtime_error("MMAC packed variants require MIOPEN_ADAPTIVE_LSTM_ENABLE_MMAC_BUILTIN");
 #endif
 
-  if (!write_sequence) {
-    return h_state;
-  }
+  if (!write_sequence) return h_state;
   return out;
+}
+
+torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj, const torch::Tensor& packed_weight, const torch::Tensor& bias,
+    torch::Tensor h_state, torch::Tensor c_state, torch::Tensor out, torch::Tensor profile_out,
+    bool write_sequence, int64_t read_block, int64_t variant) {
+  return launch_packed_mmac<128>(gate_proj, packed_weight, bias, h_state, c_state, out, profile_out, write_sequence, read_block, variant);
+}
+
+torch::Tensor adaptive_lstm_h256_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj, const torch::Tensor& packed_weight, const torch::Tensor& bias,
+    torch::Tensor h_state, torch::Tensor c_state, torch::Tensor out, torch::Tensor profile_out,
+    bool write_sequence, int64_t read_block, int64_t variant) {
+  return launch_packed_mmac<256>(gate_proj, packed_weight, bias, h_state, c_state, out, profile_out, write_sequence, read_block, variant);
+}
+
+torch::Tensor adaptive_lstm_h512_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj, const torch::Tensor& packed_weight, const torch::Tensor& bias,
+    torch::Tensor h_state, torch::Tensor c_state, torch::Tensor out, torch::Tensor profile_out,
+    bool write_sequence, int64_t read_block, int64_t variant) {
+  return launch_packed_mmac<512>(gate_proj, packed_weight, bias, h_state, c_state, out, profile_out, write_sequence, read_block, variant);
 }
 

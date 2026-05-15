@@ -68,6 +68,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       &adaptive_lstm_h128_mmac_packed_variant_forward_workspace,
       "MIOpen-inspired H128 MMAC packed-weight profile variant LSTM hidden update (0=MMAC,1=+bias,2=+act,3=full)");
   m.def(
+      "adaptive_lstm_h256_mmac_packed_variant_forward_workspace",
+      &adaptive_lstm_h256_mmac_packed_variant_forward_workspace,
+      "MIOpen-inspired H256 MMAC packed-weight profile variant LSTM hidden update (0=MMAC,1=+bias,2=+act,3=full)");
+  m.def(
+      "adaptive_lstm_h512_mmac_packed_variant_forward_workspace",
+      &adaptive_lstm_h512_mmac_packed_variant_forward_workspace,
+      "MIOpen-inspired H512 MMAC packed-weight profile variant LSTM hidden update (0=MMAC,1=+bias,2=+act,3=full)");
+  m.def(
       "adaptive_lstm_gemm_scan_update_forward_workspace",
       &adaptive_lstm_gemm_scan_update_forward_workspace,
       "MIOpen-inspired generic GEMM scan LSTM hidden update with caller workspace");

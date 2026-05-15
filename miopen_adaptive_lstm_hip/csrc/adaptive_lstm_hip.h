@@ -146,6 +146,30 @@ torch::Tensor adaptive_lstm_h128_mmac_packed_variant_forward_workspace(
     int64_t read_block,
     int64_t variant);
 
+torch::Tensor adaptive_lstm_h256_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& bias,
+    torch::Tensor h_state,
+    torch::Tensor c_state,
+    torch::Tensor out,
+    torch::Tensor profile_out,
+    bool write_sequence,
+    int64_t read_block,
+    int64_t variant);
+
+torch::Tensor adaptive_lstm_h512_mmac_packed_variant_forward_workspace(
+    const torch::Tensor& gate_proj,
+    const torch::Tensor& packed_weight,
+    const torch::Tensor& bias,
+    torch::Tensor h_state,
+    torch::Tensor c_state,
+    torch::Tensor out,
+    torch::Tensor profile_out,
+    bool write_sequence,
+    int64_t read_block,
+    int64_t variant);
+
 torch::Tensor adaptive_lstm_gemm_scan_update_forward_workspace(
     const torch::Tensor& gate_proj,
     const torch::Tensor& weight_hh,
