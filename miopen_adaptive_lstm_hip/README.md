@@ -105,15 +105,16 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 固定参数：`input=5, layers=4, output=24, seq_len=1000`，100 次迭代
 
-默认配置：auto 后端 + fp16 recurrent。覆盖率最优路径。
+默认配置：`auto` 后端 + `fp16` recurrent compute。
 
-### batch=512（默认）
+### batch=512
 
-| 路径 | H128 | H256 | H512 | 说明 |
-|------|------|------|------|------|
-| 原生 PyTorch | 7.63s | 11.03s | 21.67s | MIOpen 基线 |
-| **自动最优** | **4.48s** | **7.36s** | 32.05s | H128→MMAC, H>128→gemm_scan fp16 |
-| 对比原生 | **-41%** | **-33%** | +48% | H512 b512 建议用原生 |
+| 路径 | H128 | H256 | H512 |
+|------|------|------|------|
+| 原生 PyTorch | 7.63s | 11.03s | 21.67s |
+| **当前最优** | **4.48s** | **7.36s** | **21.67s** |
+| 最优后端 | persistent_mmac packed | gemm_scan fp16 | 原生 PyTorch |
+| vs 原生 | **-41%** | **-33%** | 持平 |
 
 ### 优化历程
 
