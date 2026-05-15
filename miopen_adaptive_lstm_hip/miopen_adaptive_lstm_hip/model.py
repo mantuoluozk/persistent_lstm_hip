@@ -672,9 +672,12 @@ class AdaptiveLSTMRegressor(nn.Module):
                     and _use_gemm_scan_workspace(ext)
                 )
                 use_generic_gemm_scan_workspace = (
-                    backend == "gemm_scan"
+                    backend in {"gemm_scan", "persistent_mmac"}
                     and hidden_size != 128
-                    and hasattr(ext, "adaptive_lstm_gemm_scan_update_forward_workspace")
+                    and (
+                        hasattr(ext, "adaptive_lstm_gemm_scan_update_forward_workspace")
+                        or hasattr(ext, f"adaptive_lstm_h{hidden_size}_mmac_packed_variant_forward_workspace")
+                    )
                     and _use_gemm_scan_workspace(ext)
                 )
                 workspace = (
@@ -777,17 +780,18 @@ class AdaptiveLSTMRegressor(nn.Module):
                     use_packed_mmac = _use_packed_mmac(ext, hidden_size) and args.packed_weight_hh is not None
                     packed_fn = _get_packed_mmac_fn(ext, hidden_size) if use_packed_mmac else None
                     prefix = f"h{hidden_size}"
-                    if workspace is not None:
-                        out_workspace = workspace.last_out if is_last else workspace.seq_buffers[layer_idx & 1]
+                    recurrent_workspace = workspace if workspace is not None else generic_workspace
+                    if recurrent_workspace is not None:
+                        out_workspace = recurrent_workspace.last_out if is_last else recurrent_workspace.seq_buffers[layer_idx & 1]
                         if use_packed_mmac and packed_fn:
                             layer_input = packed_fn(
                                 gate,
                                 args.packed_weight_hh,
                                 args.bias,
-                                workspace.h_state,
-                                workspace.c_state,
+                                recurrent_workspace.h_state,
+                                recurrent_workspace.c_state,
                                 out_workspace,
-                                workspace.recur,
+                                recurrent_workspace.recur,
                                 not is_last,
                                 actual_gemm_scan_read_block,
                                 3,
@@ -799,8 +803,8 @@ class AdaptiveLSTMRegressor(nn.Module):
                                 gate,
                                 args.weight_hh,
                                 args.bias,
-                                workspace.h_state,
-                                workspace.c_state,
+                                recurrent_workspace.h_state,
+                                recurrent_workspace.c_state,
                                 out_workspace,
                                 not is_last,
                                 actual_gemm_scan_read_block,
@@ -808,6 +812,8 @@ class AdaptiveLSTMRegressor(nn.Module):
                             )
                             actual_kernel_name = f"{prefix}_persistent_mmac"
                             actual_pipeline_name = "persistent_mmac"
+                        else:
+                            raise RuntimeError(f"persistent_mmac for H{hidden_size} requires packed MMAC function")
                         actual_gemm_scan_workspace = True
                     else:
                         _h_state = torch.zeros((batch_size, hidden_size), device=gate.device, dtype=gate.dtype)
