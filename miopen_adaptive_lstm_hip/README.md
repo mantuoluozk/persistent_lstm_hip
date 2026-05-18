@@ -39,7 +39,10 @@ for each timestep:
 | `persistent_mmac` | **H≤128（auto 默认）** | 单 kernel 持久化，HCU MMAC + packed weight，H128 4.39s |
 | `gemm_scan` | **H=256（auto 默认）** | rocBLAS GEMM per timestep + HIP pointwise，fp16，7.25s |
 | `gemm_scan (gate_accum)` | **H≥512（auto 默认）** | MIOpen 风格累加式 GEMM + fp16，H512 10.06s |
-（另有 `seqmajor_accum`、`cached`、`partitioned`、`scalar` 等实验性后端，可通过 `MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND` 手动切换）
+| `seqmajor_accum` | H128 | 实验性，seq-major 门控累加 |
+| `cached` | H128 | 权重缓存标量 |
+| `partitioned` | 全部 | 分区标量点积 |
+| `scalar` | 全部 | 通用标量回退 |
 
 ### persistent_mmac
 
