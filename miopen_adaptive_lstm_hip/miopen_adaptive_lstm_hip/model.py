@@ -100,7 +100,6 @@ def _use_h128_cached_path(ext, hidden_size: int) -> bool:
 def _recurrent_backend(ext, hidden_size: int) -> str:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND", "auto").strip().lower()
     if raw in {"", "auto", "best"}:
-        # H<=128: persistent_mmac packed (4.48s), H>128: gemm_scan
         raw = "persistent_mmac" if hidden_size <= 128 else "gemm_scan"
     if raw not in {"seqmajor_accum", "gemm_scan", "cached", "partitioned", "scalar", "persistent_mmac"}:
         raise ValueError(
@@ -287,7 +286,7 @@ def _get_packed_mmac_fn(ext, hidden_size: int):
     return getattr(ext, fn_name, None)
 
 
-def _use_gate_accum_scan() -> bool:
+def _use_gate_accum_scan(hidden_size: int = 0) -> bool:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_GATE_ACCUM", "0").strip().lower()
     if raw in {"0", "false", "no", "off", "disable", "disabled"}:
         return False
@@ -864,7 +863,7 @@ class AdaptiveLSTMRegressor(nn.Module):
                             plan.hidden_launch.read_block, hidden_size
                         )
                         actual_direct_blas = _use_direct_blas()
-                        use_gate_accum_scan = _use_gate_accum_scan()
+                        use_gate_accum_scan = _use_gate_accum_scan(hidden_size)
                         use_fixed_hidden_scan = _use_fixed_hidden_scan()
                         if (
                             use_gate_accum_scan
