@@ -4,14 +4,14 @@
 
 ## 项目对比
 
-| | [miopen_adaptive_lstm_hip](miopen_adaptive_lstm_hip/) | [persistent_lstm_hip](persistent_lstm_hip/) |
-|------|------|------|
-| 思路 | MIOpen 风格多后端调度 | 固定形状深度特化 |
-| 泛化能力 | **任意 hidden_size** | 固定 shape |
-| H128 (5/128/4/24, b512) | **4.39s** | 3.08s |
-| H256 | **7.25s** | — |
-| H512 | **10.06s** | — |
-| 核心技术 | MMAC + packed weight + Split-B + gate_accum fp16 | 4 层融合 + uniform batch fast path |
+| | 原生 PyTorch (fp16) | [miopen_adaptive_lstm_hip](miopen_adaptive_lstm_hip/) | [persistent_lstm_hip](persistent_lstm_hip/) |
+|------|------|------|------|
+| 思路 | MIOpen 内置实现 | MIOpen 风格多后端调度 | 固定形状深度特化 |
+| 泛化 | 全部 | **任意 hidden_size** | 固定 shape |
+| H128 (5/128/4/24, b512) | 7.63s | **4.39s (-42%)** | **3.08s (-60%)** |
+| H256 (5/256/4/24, b512) | 11.03s | **7.25s (-34%)** | — |
+| H512 (5/512/4/24, b512) | 21.70s | **10.06s (-54%)** | — |
+| 核心技术 | — | MMAC + packed weight + gate_accum fp16 | 4 层融合 + uniform batch fast path |
 
 ## miopen_adaptive_lstm_hip（当前主力）
 
