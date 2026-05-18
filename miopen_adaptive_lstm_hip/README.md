@@ -116,18 +116,24 @@ batch=512，100 次迭代。默认 `auto` 后端会自动选择最优路径。
 
 ### 优化历程
 
-| 阶段 | 耗时 | 关键突破 |
-|------|------|---------|
-| 初版 | 144s | HCU MMAC 打通 |
-| 四修复 + A-reuse | 7.34s | weight 修正、A-fragment 复用 |
-| Wavefront 并行 | 11.43s | wave_id 消除 4x 重复计算 |
-| Weight pre-packing | 7.54s | packed layout + wave_id |
-| **Split-B (B=4)** | **4.79s** | grid=128, 反超 gemm_scan |
-| P1 双缓冲 + P2 减少 sync | **4.40s** | 指针交换 + sync 2→1 |
-| Multi-size 参数化 | H256/H512 | HiddenSize 模板 |
-| fp16 recurrent 默认 + gate_accum | H256 7.25s / H512 10.06s | **全尺寸超越原生** |
+### H128 MMAC 优化
 
-已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront (22.8s vs 15.9s)、MMAC B=8 H256 (22.8s)、MinBlocksPerCU H256 (无提升，LDS 硬限制)
+| 阶段 | H128 耗时 | 关键突破 |
+|------|----------|---------|
+| HCU MMAC 初版 | 144s | 打通 `__builtin_hcu_mmac_*`，但 weight 读反、OOB 等 bugs |
+| 关键修复 + wave_id | ~11s | weight 修正、A-reuse、wave_id 消除 4x wavefront 冗余 |
+| Packed weight + Split-B | **4.79s** | packed layout、B=4 grid=128，反超 gemm_scan |
+| 双缓冲 + 减少 sync | **4.40s** | h_state 指针交换、syncthreads 2→1/timestep |
+
+### H256/H512 优化
+
+| 阶段 | H256 | H512 | 关键突破 |
+|------|------|------|---------|
+| Multi-size 参数化 | 15.95s | 50.60s | HiddenSize 模板，MMAC 通了但慢于 gemm_scan |
+| gemm_scan fp16 | 7.25s | 32.51s | 循环 GEMM 从 fp32→fp16 |
+| gate_accum fp16 | — | **10.06s** | H512 专属，累加式 GEMM + fp16 |
+
+已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront、MMAC B=8、MinBlocksPerCU
 
 ## 优化参考：可借鉴技术
 
