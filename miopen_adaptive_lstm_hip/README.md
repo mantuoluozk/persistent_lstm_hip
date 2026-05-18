@@ -126,9 +126,9 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | Weight pre-packing | 7.54s | packed layout + wave_id |
 | **Split-B (B=4)** | **4.79s** | grid=128, 反超 gemm_scan |
 | P1 双缓冲 + P2 减少 sync | **4.40s** | 指针交换 + sync 2→1 |
-| Multi-size 参数化 | H256/H512 | HiddenSize 模板自动适配 |
+| Multi-size + fp16 recurrent | H256 7.36s / H512 32.05s | HiddenSize 模板 + fp16 GEMM 默认 |
 
-已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront (H256 恶化)
+已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront (22.8s vs 15.9s)、MMAC B=8 H256 (22.8s)、MinBlocksPerCU H256 (无提升，LDS 硬限制)
 
 ## 优化参考：可借鉴技术
 
@@ -224,5 +224,5 @@ miopen_adaptive_lstm_hip/
 - ☐ H256/H512 MMAC 性能优化（hidden tile 并行拆分）
 - ☐ 线性头融合
 - ☐ 4 层融合 kernel
-- ✅ Shape-aware 自动后端选择（H≤128→MMAC, H>128→gemm_scan）
+- ✅ Shape-aware 自动后端 + fp16 默认（auto=H≤128→MMAC, H>128→gemm_scan fp16）
 - ☐ BF16/FP32、训练模式
