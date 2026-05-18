@@ -15,14 +15,12 @@ ROCm/HIP 环境里。
 | --- | --- | --- | --- |
 | 固定形状 | `input=5, hidden=128, layers=4, output=24` | 已完成 | 最早的业务 shape，做了最深的手工特化 |
 | H64 bucket | `hidden_size=64`，`input_size/num_layers/output_dim` 动态 | 已完成 | 非全 1 输入也走 HIP 优化路径 |
-| H128 bucket | `hidden_size=128`，`input_size/num_layers/output_dim` 动态 | 进行中 | 当前有最快 `recur_gemm` 路径和少 kernel 的 `persistent_scalar` 研究路径 |
-| H256+ bucket | `hidden_size>=256` | 未开始 | 等 H128 路线稳定后再扩展 |
+| H128 bucket | `hidden_size=128`，`input_size/num_layers/output_dim` 动态 | 已完成 | `recur_gemm` 和 `persistent_scalar` 两条路径。泛化工作由 miopen_adaptive_lstm_hip 接棒 |
+| H256+ bucket | `hidden_size>=256` | 由 miopen_adaptive_lstm_hip 接棒 | 参见 ../miopen_adaptive_lstm_hip |
 
 ## 架构
 
-![Persistent LSTM HIP architecture](image/architecture.png)
-
-对上层代码来说，入口保持简单：
+入口保持简单：
 
 ```python
 from persistent_lstm_hip import convert_regressor_module
@@ -133,19 +131,18 @@ output_dim  = dynamic
 ```bash
 cd persistent_lstm_hip
 python setup.py build_ext --inplace
-cd ..
 ```
 
 运行原生 baseline：
 
 ```bash
-python LSTM.py
+python ../LSTM.py
 ```
 
 运行 HIP 包装版本：
 
 ```bash
-python LSTM-hip.py
+python ../LSTM-hip.py
 ```
 
 打印实际命中的后端：
@@ -191,29 +188,27 @@ USE_PERSISTENT_LSTM_HIP=0 python LSTM-hip.py
 ## 目录结构
 
 ```text
-.
-├── LSTM.py
-├── LSTM-hip.py
+persistent_lstm_hip/
 ├── README.md
-└── persistent_lstm_hip
-    ├── setup.py
-    ├── csrc
-    │   ├── bindings.cpp
-    │   ├── persistent_lstm_op.cpp
-    │   ├── persistent_lstm_hip.h
-    │   └── persistent_lstm_hip.cu
-    └── persistent_lstm_hip
-        ├── api.py
-        ├── extension.py
-        ├── model.py
-        ├── packing.py
-        └── reference.py
+├── setup.py
+├── benchmark_persistent_lstm.py
+├── csrc/
+│   ├── bindings.cpp
+│   ├── persistent_lstm_hip.cu
+│   ├── persistent_lstm_hip.h
+│   ├── persistent_lstm_op.cpp
+│   └── persistent_lstm_reference.cpp
+└── persistent_lstm_hip/
+    ├── api.py
+    ├── extension.py
+    ├── model.py
+    ├── packing.py
+    └── reference.py
 ```
 
 ## 路线图
 
-1. 收敛 H128：把 `recur_gemm` 作为速度 baseline，把 `persistent_scalar` 作为少 kernel baseline。
-2. 继续分析 H128 hipprof/PMC：重点看 recurrent 矩阵吞吐、同步开销、寄存器压力和 kernel launch 数。
-3. 设计 H128 下一版 persistent kernel：目标是减少启动次数，同时接近 GEMM 的有效吞吐。
-4. H128 稳定后扩展到 H256 bucket。
-5. 后续再考虑 BF16/FP32、更多 shape、更多硬件上的自动选择策略。
+1. ✅ 固定形状深度特化（3.08s）
+2. ✅ H64/H128 bucket
+3. H256+ 泛化 → 由 [miopen_adaptive_lstm_hip](../miopen_adaptive_lstm_hip) 接棒
+4. 后续：BF16/FP32、更多硬件
