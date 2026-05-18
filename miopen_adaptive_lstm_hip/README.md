@@ -32,32 +32,28 @@ for each timestep:
 
 ## 后端对比
 
-| 后端 | 激活方式 | 适用 hidden_size | 说明 |
-|------|---------|-----------------|------|
-| `gemm_scan` | H>128 默认 | 全部 | rocBLAS GEMM + HIP pointwise |
-| `persistent_mmac` | **H≤128 默认** | 全部 | 持久化 kernel + packed MMAC，H128 上 4.48s 最优 |
-| `persistent_mmac` | `_BACKEND=persistent_mmac` | 全部 | 持久化 kernel + packed MMAC（默认自动选择） |
-| `seqmajor_accum` | `_BACKEND=seqmajor_accum` | H128 | MIOpen 风格 seq-major 门控累加 |
-| `cached` | `_BACKEND=cached` | H128 | 权重缓存标量 kernel（B2/B4/B8 自适应） |
-| `partitioned` | `_BACKEND=partitioned` | 全部 | 分区标量点积（P4/P8 自适应） |
-| `scalar` | `_BACKEND=scalar` | 全部 | 通用标量回退（最终兜底） |
+`auto` 模式根据 `hidden_size` 自动选择最优后端，无需手动干预。
 
-### gemm_scan（默认基线）
+| 后端 | 适用 | 说明 |
+|------|------|------|
+| `persistent_mmac` | **H≤128（auto 默认）** | 单 kernel 持久化，HCU MMAC + packed weight，H128 4.39s |
+| `gemm_scan` | **H=256（auto 默认）** | rocBLAS GEMM per timestep + HIP pointwise，fp16，7.25s |
+| `gemm_scan (gate_accum)` | **H≥512（auto 默认）** | MIOpen 风格累加式 GEMM + fp16，H512 10.06s |
+| `seqmajor_accum` | H128 | 实验性，seq-major 门控累加 |
+| `cached` | H128 | 权重缓存标量 |
+| `partitioned` | 全部 | 分区标量点积 |
+| `scalar` | 全部 | 通用标量回退 |
 
-- 输入投影：`hipblasGemmEx` 一次性计算整个序列的 gate
+### persistent_mmac
+
+每层 1 次 kernel 启动。HCU MMAC (`__builtin_hcu_mmac_f32_16x16x16_f16`)，64 线程 lane mapping `row=lane&15, col0=(lane>>4)*4`，packed weight + B=4 split + 双缓冲 + 减少 syncthreads。
+
+### gemm_scan
+
+- 输入投影：`hipblasGemmEx` 一次性计算整个序列 gate
 - 循环传播：每个 timestep `hipblasGemmEx(h_state, w_hh)`
-- 隐藏更新：HIP pointwise kernel 做门控激活和细胞更新
-
-优点：rocBLAS GEMM tensor core 吞吐最优。缺点：每层 (seq_len) 次 GEMM + pointwise 启动。
-
-### persistent_mmac（持久化 kernel）
-
-每层 1 次 kernel 启动。分两个子路径：
-
-- **Packed MMAC**（默认，`MIOPEN_ADAPTIVE_LSTM_MMAC_PACKED=1`）：HCU MMAC + packed weight + wave_id + B=4 split，H128 上 4.48s
-- **标量回退**（`MIOPEN_ADAPTIVE_LSTM_USE_MMAC=0`）：P4 分区标量，H128 上 ~11.2s
-
-HCU MMAC：`__builtin_hcu_mmac_f32_16x16x16_f16`，64 线程 lane mapping `row=lane&15, col0=(lane>>4)*4`。
+- 隐藏更新：HIP pointwise kernel 做激活和状态更新
+- H512 自动启用 gate_accum：GEMM 直接累加到 gate workspace (beta=1)
 
 ## 环境变量
 
