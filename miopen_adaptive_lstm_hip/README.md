@@ -79,26 +79,16 @@ HCU MMAC：`__builtin_hcu_mmac_f32_16x16x16_f16`，64 线程 lane mapping `row=l
 # 编译
 python setup.py build_ext --inplace
 
-# 默认 auto（自动选最优：H128→MMAC 4.48s, H>128→gemm_scan）
-python run_adaptive_lstm.py
+# 运行（auto 后端，自动选最优路径）
+python run_adaptive_lstm.py                       # H128, batch=512
+MIOPEN_ADAPTIVE_HIDDEN=256 python run_adaptive_lstm.py  # H256
+MIOPEN_ADAPTIVE_HIDDEN=512 python run_adaptive_lstm.py  # H512
 
-# H256/H512（自动走 gemm_scan）
-MIOPEN_ADAPTIVE_HIDDEN=256 python run_adaptive_lstm.py
-
-# 手动覆盖后端
-MIOPEN_ADAPTIVE_LSTM_RECURRENT_BACKEND=persistent_mmac python run_adaptive_lstm.py
-
-# 调试输出
+# 调试信息（看实际命中的 kernel 和参数）
 MIOPEN_ADAPTIVE_LSTM_DEBUG=1 python run_adaptive_lstm.py
 
-# 多 shape 回归测试
-python run_shape_sweep.py
-MIOPEN_ADAPTIVE_SWEEP=128:512,256:512,512:128 python run_shape_sweep.py
-
-# 对比原生基线
-python run_native_lstm_sweep.py
-python run_shape_sweep.py
-python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
+# 自定义 batch/迭代次数
+MIOPEN_ADAPTIVE_BATCH=256 MIOPEN_ADAPTIVE_ITERS=20 python run_adaptive_lstm.py
 ```
 
 ## 性能记录（K100_AI / gfx928，2026-05-15）
