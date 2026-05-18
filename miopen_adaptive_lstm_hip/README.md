@@ -103,18 +103,16 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 
 ## 性能记录（K100_AI / gfx928，2026-05-15）
 
-固定参数：`input=5, layers=4, output=24, seq_len=1000`，100 次迭代
+batch=512，100 次迭代。默认 `auto` 后端会自动选择最优路径。
 
-默认配置：`auto` 后端 + `fp16` recurrent compute。
-
-### batch=512
-
-| 路径 | H128 | H256 | H512 |
+| | H128 | H256 | H512 |
 |------|------|------|------|
-| 原生 PyTorch | 7.63s | 11.03s | 21.67s |
-| **当前最优** | **4.48s** | **7.36s** | **21.67s** |
-| 最优后端 | persistent_mmac packed | gemm_scan fp16 | 原生 PyTorch |
-| vs 原生 | **-41%** | **-33%** | 持平 |
+| **shape** | `5/128/4/24, b512, s1000` | `5/256/4/24, b512, s1000` | `5/512/4/24, b512, s1000` |
+| 原生 PyTorch (fp16) | 7.63s | 11.03s | 21.70s |
+| **当前最优** | **4.39s** | **7.25s** | **10.06s** |
+| 最优后端 | persistent_mmac packed | gemm_scan fp16 | gate_accum fp16 |
+| 提升 vs 原生 | **-42%** | **-34%** | **-54%** |
+| 精度 max_abs | ~0.020 | ~0.010 | ~0.008 |
 
 ### 优化历程
 
@@ -126,7 +124,8 @@ python compare_lstm_sweeps.py --native native.log --adaptive adaptive.log
 | Weight pre-packing | 7.54s | packed layout + wave_id |
 | **Split-B (B=4)** | **4.79s** | grid=128, 反超 gemm_scan |
 | P1 双缓冲 + P2 减少 sync | **4.40s** | 指针交换 + sync 2→1 |
-| Multi-size + fp16 recurrent | H256 7.36s / H512 32.05s | HiddenSize 模板 + fp16 GEMM 默认 |
+| Multi-size 参数化 | H256/H512 | HiddenSize 模板 |
+| fp16 recurrent 默认 + gate_accum | H256 7.25s / H512 10.06s | **全尺寸超越原生** |
 
 已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront (22.8s vs 15.9s)、MMAC B=8 H256 (22.8s)、MinBlocksPerCU H256 (无提升，LDS 硬限制)
 
