@@ -29,11 +29,11 @@ cd persistent_lstm_hip
 python setup.py build_ext --inplace
 
 # 固定形状 HIP
-python ../LSTM-hip.py
+python LSTM-hip.py
 
 # H128 最快路径
-PERSISTENT_LSTM_HIP_H128_MODE=best python ../LSTM-hip.py
+PERSISTENT_LSTM_HIP_H128_MODE=best python LSTM-hip.py
 
 # 调试
-PERSISTENT_LSTM_HIP_DEBUG=1 python ../LSTM-hip.py
+PERSISTENT_LSTM_HIP_DEBUG=1 python LSTM-hip.py
 ```

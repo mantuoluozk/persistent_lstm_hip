@@ -1,18 +1,10 @@
 import os
-import sys
 import time
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-
-ROOT = Path(__file__).resolve().parent
-PKG_ROOT = ROOT / "persistent_lstm_hip"
-if str(PKG_ROOT) not in sys.path:
-    sys.path.insert(0, str(PKG_ROOT))
-
-from persistent_lstm_hip import convert_regressor_module  # noqa: E402
+from persistent_lstm_hip import convert_regressor_module
 
 
 torch.backends.cudnn.benchmark = True
