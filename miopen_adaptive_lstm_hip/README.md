@@ -94,10 +94,10 @@ batch=512，100 次迭代。默认 `auto` 后端会自动选择最优路径。
 | | H128 | H256 | H512 |
 |------|------|------|------|
 | **shape** | `5/128/4/24, b512, s1000` | `5/256/4/24, b512, s1000` | `5/512/4/24, b512, s1000` |
-| 原生 PyTorch (fp16) | 7.63s | 11.03s | 21.70s |
-| **当前最优** | **4.39s** | **7.25s** | **10.06s** |
+| 原生 PyTorch (fp16) | 7.68s | 11.26s | 17.37s |
+| **当前最优** | **4.39s** | **6.78s** | **9.89s** |
 | 最优后端 | persistent_mmac packed | gemm_scan fp16 | gate_accum fp16 |
-| 提升 vs 原生 | **-42%** | **-34%** | **-54%** |
+| 提升 vs 原生 | **-43%** | **-40%** | **-43%** |
 | 精度 max_abs | ~0.020 | ~0.010 | ~0.008 |
 
 ### 优化历程
@@ -116,8 +116,8 @@ batch=512，100 次迭代。默认 `auto` 后端会自动选择最优路径。
 | 阶段 | H256 | H512 | 关键突破 |
 |------|------|------|---------|
 | Multi-size 参数化 | 15.95s | 50.60s | HiddenSize 模板，MMAC 通了但慢于 gemm_scan |
-| gemm_scan fp16 | 7.25s | 32.51s | 循环 GEMM 从 fp32→fp16 |
-| gate_accum fp16 | — | **10.06s** | H512 专属，累加式 GEMM + fp16 |
+| gemm_scan fp16 | 6.78s | 32.51s | 循环 GEMM 从 fp32→fp16 |
+| gate_accum fp16 | — | **9.89s** | H512 专属，累加式 GEMM + fp16 |
 
 已回退：Weight 驻留 (8.78s)、Register-direct (7.95s)、LDS B-tile staging (8.36s)、8-wavefront、MMAC B=8、MinBlocksPerCU
 
