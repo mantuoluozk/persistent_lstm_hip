@@ -141,19 +141,7 @@ batch=512，100 次迭代。默认 `auto` 后端会自动选择最优路径。
 - **XDLops/MFMA**：使用 AMD 矩阵指令做 tile 级 GEMM
 - **波前级驻留控制**：通过 `__launch_bounds__` 控制寄存器压力
 
-### persistent_lstm_hip 可借鉴技术
-
-| 优先级 | 技术 | 预期收益 | 说明 |
-|--------|------|---------|------|
-| ✅ | MMAC + packed weight | 大 | 已实现，H128 4.48s |
-| ✅ | Split-B + wave_id | 大 | 已实现 |
-| P1 | 线性头融合 | 小 | `torch.mm + add_` 融合进最后 LSTM kernel |
-| P1 | 4 层融合 kernel | 中 | 所有层融合到单个 kernel |
-| P2 | H256/H512 MMAC 优化 | 中 | hidden tile 并行拆分 |
-| P2 | Shape-aware 后端选择 | 中 | H≤128→MMAC, H>128→gemm_scan |
-| P3 | Uniform batch fast path | 大 | 检测全批次相同输入，只算 1 行 + 广播 |
-
-### MFMA 技术备忘
+### MMAC 技术备忘
 
 DTK `dcc 25.10.0-0`（clang 17）上已穿透的正确 intrinsic 调用：
 
@@ -194,9 +182,8 @@ miopen_adaptive_lstm_hip/
 ├── run_shape_sweep.py             # 多 shape 回归
 ├── run_profile_sweep.py           # 性能分析
 ├── run_compute_sweep.py           # 精度模式对比
-├── hcu builtin汇总 - 260425.xlsx   # HCU MMAC 指令表
 ├── csrc/
-│   ├── adaptive_lstm_hip.cu       # 核心 kernel（含 MFMA persistent kernel）
+│   ├── adaptive_lstm_hip.cu       # 核心 kernel（含 MMAC persistent kernel）
 │   ├── adaptive_lstm_hip.h
 │   ├── adaptive_lstm_pipeline.h
 │   └── bindings.cpp
@@ -205,23 +192,20 @@ miopen_adaptive_lstm_hip/
 │   ├── api.py / extension.py
 │   ├── pipeline.py / scheduler.py / selector.py / descriptors.py / modular.py
 │   └── official_refs.py
-├── third_party_refs/              # MIOpen/CK 官方参考源码
-│   ├── ck/
-│   └── *.cpp
 └── tests/
 ```
 
 ## 路线图
 
-- ✅ HCU MMAC 打通 + 四修复 + A-reuse
-- ✅ Wavefront 并行（wave_id 消除 4x 重复计算）
-- ✅ LDS bank conflict 修复（padding stride）
-- ✅ Weight pre-packing（packed layout）
-- ✅ Split-B (batch_tile=4, grid=128, 反超 gemm_scan)
-- ✅ 双缓冲 h_state + 减少 syncthreads
+已完成：
+- ✅ HCU MMAC 打通、wavefront 并行、LDS bank conflict 修复
+- ✅ Weight pre-packing + Split-B (B=4) + 双缓冲 + 减少 syncthreads
 - ✅ Multi-size 参数化（H128/H256/H512）
-- ☐ H256/H512 MMAC 性能优化（hidden tile 并行拆分）
+- ✅ Shape-aware 自动后端 + fp16 recurrent 默认
+- ✅ H128/H256/H512 全线超越原生 PyTorch
+
+待探索：
 - ☐ 线性头融合
-- ☐ 4 层融合 kernel
-- ✅ Shape-aware 自动后端 + fp16 默认（auto=H≤128→MMAC, H>128→gemm_scan fp16）
+- ☐ 4 层融合 persistent kernel
+- ☐ H256/H512 大 batch 场景进一步优化
 - ☐ BF16/FP32、训练模式

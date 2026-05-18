@@ -4,7 +4,6 @@ build/
 *.pyd
 __pycache__/
 **/__pycache__/
-third_party_refs/rocm-libraries/
-third_party_refs/ck_repo/
-
+*.xlsx
+third_party_refs/
 官方实现/
