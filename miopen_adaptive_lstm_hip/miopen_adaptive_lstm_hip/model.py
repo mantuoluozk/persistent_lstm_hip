@@ -11,6 +11,10 @@ from .descriptors import HardwareDescriptor, RNNDescriptor, RuntimeMode, SeqTens
 from .extension import load_extension
 from .modular import build_forward_plan
 
+# Must set before any CUDA/HIP call — C++ recurrent_compute_type() reads env directly
+if "MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE" not in os.environ:
+    os.environ["MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE"] = "fp16"
+
 
 @dataclass(frozen=True)
 class AdaptiveLayerArgs:
@@ -175,6 +179,7 @@ def _use_direct_blas() -> bool:
 
 def _recurrent_compute_mode() -> str:
     raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE", "fp16").strip().lower()
+    os.environ["MIOPEN_ADAPTIVE_LSTM_RECURRENT_COMPUTE"] = raw
     if raw in {"", "fp32", "32", "float"}:
         return "fp32"
     if raw in {"fp16", "16", "half"}:
@@ -287,10 +292,12 @@ def _get_packed_mmac_fn(ext, hidden_size: int):
 
 
 def _use_gate_accum_scan(hidden_size: int = 0) -> bool:
-    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_GATE_ACCUM", "0").strip().lower()
+    raw = os.environ.get("MIOPEN_ADAPTIVE_LSTM_GATE_ACCUM", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return hidden_size >= 512
     if raw in {"0", "false", "no", "off", "disable", "disabled"}:
         return False
-    if raw not in {"", "1", "true", "yes", "on", "auto"}:
+    if raw not in {"1", "true", "yes", "on"}:
         raise ValueError("MIOPEN_ADAPTIVE_LSTM_GATE_ACCUM must be 1, 0, or auto")
     return True
 
