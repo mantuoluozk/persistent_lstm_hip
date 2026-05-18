@@ -4,19 +4,17 @@
 
 ## 项目对比
 
-| | | 原生 PyTorch (fp16) | [miopen_adaptive_lstm_hip](miopen_adaptive_lstm_hip/) | [persistent_lstm_hip](persistent_lstm_hip/) |
+| | 原生 PyTorch (fp16) | [miopen_adaptive_lstm_hip](miopen_adaptive_lstm_hip/) | [persistent_lstm_hip](persistent_lstm_hip/) |
 |------|------|------|------|
-| 思路 | MIOpen 内置实现 | MIOpen 风格多后端调度 | 固定形状深度特化 |
-| 泛化 | 全部 | **任意 hidden_size** | 固定 shape |
-| H128 (5/128/4/24, b512, s1000) | 8.21s | **4.39s (-47%)** | **3.08s (-62%)** |
-| H256 (5/256/4/24, b512, s1000) | 11.77s | **7.16s (-39%)** | — |
-| H512 (5/512/4/24, b512, s1000) | 22.73s | **9.83s (-57%)** | — |
-| 核心技术 | — | MMAC + packed weight + gate_accum fp16 | 4 层融合 + uniform batch fast path |
+| 思路 | MIOpen 内置 | 多后端调度，auto 自适应 | 固定形状特化 |
+| H128 `5/128/4/24, b512` | 8.21s | **4.39s (-47%)** | **3.08s (-62%)** |
+| H256 `5/256/4/24, b512` | 11.77s | **7.16s (-39%)** | — |
+| H512 `5/512/4/24, b512` | 22.73s | **9.83s (-57%)** | — |
 
 ## miopen_adaptive_lstm_hip（当前主力）
 
 - 泛化到 H128/H256/H512，auto 后端自动选择最优路径
-- 三条路径全线超越原生 PyTorch（42%/34%/54%）
+- 三条路径全线超越原生 PyTorch（47%/39%/57%）
 - 详细文档：[miopen_adaptive_lstm_hip/README.md](miopen_adaptive_lstm_hip/README.md)
 
 ## persistent_lstm_hip（参考项目）
