@@ -13,3 +13,4 @@ dist/
 *.obj
 
 .DS_Store
+.claude/
